@@ -1,0 +1,2068 @@
+#!/usr/bin/env python3
+"""Join a BDSP console's mesh: the Mesh Station Protocol (0x14) connection request and what
+follows it.
+
+The console's parser (main.bin 0x0154ebd0; pokeldn/ldn/station_protocol.py has the field-by-field
+reading) checks in this order:
+
+    the target constant id and variable id must be the console's own   -> else silence
+    the protocol count at [0xF] must equal the console's own count     -> else silence
+    each protocol's version must match what the console registers      -> else a reply
+
+An id the console does not register has an expected version of 0, so a request carrying N entries
+of (id 0xFF, version 1) draws "version too high" exactly when N is the console's protocol count and
+silence otherwise. Sweeping N measures that count without knowing any of its protocols.
+
+The Local Protocol ack goes first, so the console falls silent and any packet afterwards is an
+answer to us. docs/bdsp_session.md. Never pass --verbose to a live run; use --capture.
+"""
+import argparse, json, os, pathlib, socket, struct, sys, time, zlib
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
+BUNDLED = os.path.join(PROJECT_ROOT, 'vendor', 'LDN')
+if os.path.isdir(BUNDLED):
+    sys.path.insert(0, BUNDLED)
+
+import trio, ldn
+from pokeldn.bdsp import COMM_ID, PASSPHRASE, PIA_PORT, pokemon, room, session_keys
+from pokeldn.ldn import (local_protocol as lp, mesh_protocol as mp, reliable5 as rl,
+                        rtt_protocol as rtt, station_protocol as stp)
+from pokeldn.ldn.pia5 import (PiaHeader5, is_pia5, ciphertext, gcm_iv, ldn_nonce_crc,
+                              build_message, pad_payload, parse_messages, encrypt_payload,
+                              decrypt_payload)
+from pokeldn.ldn.transport import board_radio, find_ap_phy
+
+UNRELIABLE_PROTOCOL = 0x68        # the console's own list; its payload is the game's live state
+from pokeldn.host_support import resolve_keys
+
+
+async def diglett_increment_once(send, record, points, elapsed):
+    """Non-idempotent increment: one attempt, no retry after an ambiguous ACK."""
+    if not 1 <= points <= 40:
+        raise ValueError("Diglett increments must be between 1 and 40")
+    payload = room.build_fields(0x47, points)
+    record(rec="diglett_probe_attempt", t=elapsed(), points=points)
+    acked = await send(payload, "Diglett +%d (one attempt)" % points, tries=1)
+    record(rec="diglett_probe_result", t=elapsed(), reliable_acked=acked,
+           game_effect_confirmed=False)
+    return acked
+
+
+async def diglett_fill_once(send, record, initial_count, elapsed, pause=trio.sleep):
+    """Complete one observed counter, stopping on the first ambiguous delivery."""
+    if not 0 <= initial_count < 40:
+        raise ValueError("Initial counter must be 0..39")
+    estimated = initial_count
+    while estimated < 40:
+        points = 3 if 40 - estimated >= 3 else 1
+        if not await diglett_increment_once(send, record, points, elapsed):
+            record(rec="diglett_fill_stopped", estimated_count=estimated,
+                   reason="delivery_ambiguous", game_effect_confirmed=False)
+            return False
+        estimated += points
+        record(rec="diglett_fill_progress", estimated_count=estimated,
+               game_effect_confirmed=False)
+        await pause(0.8)
+    record(rec="diglett_fill_finished", estimated_count=estimated,
+           game_effect_confirmed=False)
+    return True
+
+
+async def diglett_renew(send, record, elapsed, interval=5.0, pause=trio.sleep):
+    """The receiver ignores increments during bonus; the next tick after expiry starts it.
+
+    No inferred countdown is used. A sent/ACKed tick is not a confirmed activation.
+    Stop on an ambiguous ACK instead of retrying a non-idempotent contribution.
+    """
+    if interval < 1:
+        raise ValueError("Renew interval must be at least one second")
+    attempt = 0
+    while True:
+        attempt += 1
+        if not await diglett_increment_once(send, record, 40, elapsed):
+            record(rec="diglett_renew_stopped", t=elapsed(), attempt=attempt,
+                   reason="delivery_ambiguous", game_effect_confirmed=False)
+            return False
+        record(rec="diglett_renew_tick", t=elapsed(), attempt=attempt,
+               game_effect_confirmed=False)
+        await pause(interval)
+
+
+def cleanup():
+    if board_radio():
+        return
+    import subprocess
+    for v in ("ldn", "ldn-mon", "ldn-tap", "ldnclient"):
+        subprocess.run(["iw", "dev", v, "del"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def make_socket(ifname):
+    from pokeldn.ldn import userspace_ip  # no kernel interface (ESP32 on macOS)
+    if (user := userspace_ip.udp_socket(ifname, PIA_PORT)) is not None:
+        user.setblocking(False)
+        return user
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, ifname.encode())
+    except PermissionError:
+        pass
+    s.bind(("", PIA_PORT))
+    s.setblocking(False)
+    return s
+
+
+def wrap(keys, our_mac, src_var, dst_var, nonce8, payload, protocol, port=0,
+         destination=lp.BROADCAST, message_flags=lp.MESSAGE_FLAGS, packet_id=0):
+    """A Pia message in a Pia packet, in the framing the console accepts."""
+    body = pad_payload(build_message(payload, protocol=protocol, port=port,
+                                     message_flags=message_flags, destination=destination))
+    iv = gcm_iv(ldn_nonce_crc(keys.network_id_le, our_mac), src_var, nonce8)
+    ct, tag = encrypt_payload(keys.session_key, iv, body)
+    return PiaHeader5(dst_var=dst_var, src_var=src_var, packet_id=packet_id, footer_size=0,
+                      nonce8=nonce8, tag=tag[:8], encrypted=True).pack() + ct
+
+
+def wrap_dig_burst(keys, our_mac, src_var, dst_var, nonce8, payloads, sequence):
+    """Bundle separately sequenced reliable attacks into one ordinary Pia datagram."""
+    if not 1 <= len(payloads) <= 32:
+        raise ValueError('Dig burst size must be 1..32')
+    messages = []
+    for i, payload in enumerate(payloads):
+        if len(payload) != 15 or payload[:3] != bytes.fromhex('27000c'):
+            raise ValueError('Burst accepts native-size DigAttackData only')
+        seq = sequence+i
+        if seq >= 65535:
+            raise ValueError('Reconnect before the reliable sequence wraps')
+        reliable = rl.build_header(rl.FLAG_APPLICATION_DATA | rl.FLAG_MESSAGE_START
+                                   | rl.FLAG_MESSAGE_END | rl.FLAG_IS_INITIALIZED,
+                                   seq, len(payload), lowest_pending=sequence) + payload
+        messages.append(build_message(reliable, protocol=rl.PROTOCOL, port=rl.PORT,
+                                      message_flags=lp.MESSAGE_FLAGS, destination=lp.BROADCAST))
+    body = pad_payload(b''.join(messages))
+    if len(body)+32 > 1400:
+        raise ValueError('Burst exceeds conservative datagram size')
+    iv = gcm_iv(ldn_nonce_crc(keys.network_id_le, our_mac), src_var, nonce8)
+    ct, tag = encrypt_payload(keys.session_key, iv, body)
+    return PiaHeader5(dst_var=dst_var, src_var=src_var, packet_id=0, footer_size=0,
+                      nonce8=nonce8, tag=tag[:8], encrypted=True).pack()+ct
+
+
+async def main_async(args):
+    keys_file = ldn.load_keys(resolve_keys(args.keys))
+    phy = find_ap_phy(log=print) if args.phy == "auto" else args.phy
+    cleanup()
+    nets = await ldn.scan(keys_file, phyname=phy,
+                          channels=[int(c) for c in args.channels.split(",")],
+                          dwell_time=args.dwell)
+    want = int(args.comm_id, 16) if args.comm_id else COMM_ID
+    expected_scene = getattr(args, "expected_scene", None)
+    net = next((n for n in nets if n.local_communication_id == want
+                and (expected_scene is None or n.scene_id == expected_scene)), None)
+    if net is None:
+        print("[cx] target network not seen - is the console sitting in the room right now?")
+        return 3
+    keys = session_keys(net)
+    print(f"[cx] target ssid={net.ssid.hex()} ch={net.channel} app_version={net.app_version}")
+    print(f"[cx] scene={net.scene_id:#06x}")
+
+    param = ldn.ConnectNetworkParam()
+    param.keys, param.network, param.password = keys_file, net, PASSPHRASE
+    param.name, param.app_version = args.name.encode(), net.app_version
+    param.phyname, param.ifname = phy, args.ifname
+
+    cap = open(args.capture, "w") if args.capture else None
+
+    def record(**kw):
+        if kw.get("rec") == "game_message":
+            data_id, fields = kw.get("data_id"), kw.get("fields") or {}
+            if data_id == 0x19:
+                identity = (fields.get("zoneID"), tuple(fields.get("MainPos", ())))
+                if st.get("dig_wall_identity") != identity:
+                    st["dig_permission"] = False
+                st["dig_wall_identity"] = identity
+                st["dig_wall_open"] = True
+            elif data_id == 0x44:
+                st["dig_permission"] = bool(fields.get("isOK"))
+            elif data_id == 0x28:
+                st["dig_wall_open"] = False
+                st["dig_permission"] = False
+        sink = getattr(args, "event_sink", None)
+        if sink is not None:
+            sink(kw)
+        if cap:
+            cap.write(json.dumps(kw) + "\n")
+            cap.flush()
+
+    async with ldn.connect(param) as network:
+        info = network.info()
+        parts = list(getattr(info, "participants", []) or [])
+        host = parts[0] if parts else None
+        host_ip = getattr(host, "ip_address", None) or "169.254.54.1"
+        host_mac = bytes(getattr(host, "mac_address", b"") or b"")
+        ours = next((p for p in parts[1:] if getattr(p, "connected", False)), None)
+        our_ip = getattr(ours, "ip_address", None) or host_ip.rsplit(".", 1)[0] + ".2"
+        our_mac = bytes(getattr(ours, "mac_address", b"") or b"")
+        # Experimental independent IP endpoint supplied by the pair runner.
+        our_ip = getattr(args, "endpoint_ip", None) or our_ip
+        our_mac = getattr(args, "endpoint_mac", None) or our_mac
+        bcast = our_ip.rsplit(".", 1)[0] + ".255"
+        print(f"[cx] seat taken: us={our_ip} ({our_mac.hex()}) host={host_ip} ({host_mac.hex()})")
+        if len(our_mac) != 6 or len(host_mac) != 6:
+            print("[cx] a MAC is missing - the IV and the constant ids cannot be built")
+            return 6
+
+        identity_mac = bytes.fromhex(args.identity_mac) if getattr(args, "identity_mac", None) else our_mac
+        if len(identity_mac) != 6:
+            raise ValueError('Identity MAC must contain six bytes')
+        our_constant = stp.ldn_constant_id(identity_mac)
+        our_service = stp.ldn_service_variable_id(identity_mac)
+        host_constant = stp.ldn_constant_id(host_mac)
+        print(f"[cx] our constant id  {our_constant:#018x}  service {our_service:#010x}")
+        print(f"[cx] host constant id {host_constant:#018x}  (from its MAC)")
+        record(rec="seat", us=our_ip, our_mac=our_mac.hex(), host=host_ip,
+               host_mac=host_mac.hex(), our_constant=our_constant, host_constant=host_constant,
+               session_key=keys.session_key.hex())
+
+        sock = getattr(args, "endpoint_socket", None) or make_socket(args.ifname)
+        t0 = time.monotonic()
+        st = {"seq": None, "host_var": None, "host_constant_seen": None, "last_update": None,
+              "updates": 0, "phase": "listen", "replies": [], "waiter": None, "reply": None,
+              "reply_payload": None, "result": None,
+              "join_responses": 0, "last_join_response": None, "join_response": None,
+              "rtt_requests": 0, "rtt_answers": 0, "reliable": 0, "unreliable": 0,
+              "join_acks": 0, "dst_ip": bcast, "dst_var": 0,
+              "rel_max_seq": 0, "rel_streams": set(), "rel_control": [],
+              "rel_handshaken": False, "rel_acks": 0, "their_position": None, "their_ack_id": 0,
+              "requests": 0, "request_answers": 0, "last_request": None, "talk_answers": 0,
+              "state_requests": 0, "their_state": None, "their_recruiting": 0,
+              "reserves_sent": 0, "reserve_results": 0, "match_wait_sent": 0,
+              "reserve_accepted": False, "room_done": False, "their_traner": None,
+              "requests_sent": 0, "requested_answers": {}, "rel_fragments": {}, "their_zone": None,
+              "their_poke": None, "their_pokes": 0, "our_poke": None, "answered_with": set(), "trade_replies": 0, "check_oks": 0,
+              "their_ready_ok": None, "ready_oks_sent": 0, "their_security_state": None,
+              "our_security_state": 0, "our_next_seq": 0, "return_selects": 0}
+
+        # Build the offer before the radio is touched: a template that will not load, or a
+        # nickname that will not fit, must fail here and not mid-trade.
+        if args.trade_template:
+            edits = {k: v for k, v in (("species", args.trade_species),
+                                       ("nickname", args.trade_nickname),
+                                       ("ot_name", args.trade_ot)) if v is not None}
+            st["our_poke"] = pokemon.build_from(
+                pathlib.Path(args.trade_template).read_bytes(), **edits)
+            offered = pokemon.read(st["our_poke"])
+            print(f"[cx] offering species {offered['species']}, {offered['nickname']!r}, "
+                  f"OT {offered['ot_name']!r}, IVs {offered['ivs']}")
+
+        # --answer-with files are read now: a missing file must fail here, not while the console
+        # waits on us.
+        answer_with = {}
+        for spec in args.answer_with:
+            data_id, _, path = spec.partition(":")
+            body = pathlib.Path(path).read_bytes()
+            expected = room.NATIVE_SIZES.get(int(data_id, 0))
+            if expected and len(body) != expected:
+                raise SystemExit(f"--answer-with {spec}: {len(body)} bytes, "
+                                 f"{room.name(int(data_id, 0))} is {expected}")
+            answer_with[int(data_id, 0)] = path
+
+        nonce = int.from_bytes(os.urandom(8), "big")
+
+        def next_nonce():
+            nonlocal nonce
+            nonce = (nonce + 1) & ((1 << 64) - 1)
+            return nonce.to_bytes(8, "big")
+
+        def decode(data, addr, now):
+            h = PiaHeader5.parse(data)
+            iv = gcm_iv(ldn_nonce_crc(keys.network_id_le, host_mac), h.src_var, h.nonce8)
+            # the footer (one halfword per recipient) is not covered by the tag; leaving it in
+            # makes the packet fail to authenticate with no other symptom
+            pt = decrypt_payload(keys.session_key, iv, ciphertext(data, h.footer_size), h.tag)
+            if pt is None:
+                record(rec="rx_undecrypted", t=now, src=addr[0], raw=data[:48].hex())
+                print(f"[rx] t={now:6.2f} a packet from {addr[0]} that did NOT decrypt "
+                      f"(dst_var={h.dst_var:#010x} src_var={h.src_var:#010x})")
+                return None, []
+            return h, parse_messages(pt)
+
+        async def receiver():
+            while True:
+                await trio.lowlevel.wait_readable(sock)
+                try:
+                    data, addr = sock.recvfrom(4096)
+                except BlockingIOError:
+                    continue
+                now = time.monotonic() - t0
+                if addr[0] == our_ip:
+                    continue                  # our own broadcast, looped back on the tap
+                if getattr(args, "filter_pia_destination", False) and addr[0] != host_ip:
+                    continue
+                if not is_pia5(data):
+                    record(rec="rx_nonpia", t=now, src=addr[0], data=data[:64].hex())
+                    continue
+                if getattr(args, "filter_pia_destination", False):
+                    destination = PiaHeader5.parse(data).dst_var
+                    if destination not in (0, 1, 0xffffffff, args.src_var):
+                        continue
+                h, msgs = decode(data, addr, now)
+                if h is None:
+                    continue
+                record(rec="rx", t=now, src=addr[0], dst_var=h.dst_var, src_var=h.src_var,
+                       msgs=[{"proto": m.protocol, "port": m.port, "flags": m.message_flags,
+                              "dest": m.destination, "payload": m.payload.hex()} for m in msgs])
+                for m in msgs:
+                    if m.protocol == lp.PROTOCOL and m.payload and m.payload[1] == lp.UPDATE_SESSION:
+                        us = lp.parse_update_session(m.payload)
+                        st["last_update"] = now
+                        st["updates"] += 1
+                        st["host_var"] = us.host_variable_id
+                        st["host_constant_seen"] = int.from_bytes(us.host_constant_id, "little")
+                        if st["seq"] != us.sequence_id:
+                            st["seq"] = us.sequence_id
+                            print(f"[rx] t={now:6.2f} update session seq={us.sequence_id} "
+                                  f"host_var={us.host_variable_id:#010x} "
+                                  f"host_constant={st['host_constant_seen']:#018x}")
+                    elif m.protocol == mp.PROTOCOL:
+                        kind, name = mp.parse_message(m.payload)
+                        st["replies"].append((now, st["phase"], m.payload.hex()))
+                        st["reply"] = ("mesh", kind)
+                        st["reply_payload"] = m.payload
+                        if st["waiter"] is not None:
+                            st["waiter"].set()
+                        print(f"\n[rx] t={now:6.2f} *** MESH PROTOCOL {name} "
+                              f"({len(m.payload)} B), phase {st['phase']} ***")
+                        if kind == mp.JOIN_RESPONSE:
+                            # the host repeats this every 500 ms until acknowledged, so the count
+                            # and the time of the last one are the ack's pass signal. Ack from
+                            # here, not from the sender: the station ack for our join request
+                            # arrives first, so a sender that breaks on any reply holds no join
+                            # response.
+                            st["join_responses"] += 1
+                            st["last_join_response"] = now
+                            st["join_response"] = m.payload
+                            print(f"[rx]     {mp.parse_join_response(m.payload)}")
+                            ack = mp.ack_for(m.payload) if args.join_ack else None
+                            if ack is not None:
+                                proto, payload = ack
+                                sock.sendto(wrap(keys, our_mac, args.src_var, st["dst_var"],
+                                                 next_nonce(), payload, proto,
+                                                 port=stp.PORT_UNRELIABLE),
+                                            (st["dst_ip"], PIA_PORT))
+                                st["join_acks"] += 1
+                                record(rec="tx_mesh_ack", t=now, protocol=proto,
+                                       ack_id=mp.read_ack_id(m.payload), payload=payload.hex())
+                                print(f"[tx]     acked it on protocol {proto:#04x}, ack id "
+                                      f"{mp.read_ack_id(m.payload):#010x} "
+                                      f"({st['join_acks']} so far)")
+                        print(f"[rx]     {m.payload.hex()}\n")
+                        record(rec="mesh_protocol", t=now, phase=st["phase"], kind=kind,
+                               payload=m.payload.hex())
+                    elif m.protocol == stp.PROTOCOL:
+                        kind, rest = stp.parse_message(m.payload)
+                        # Broadcast station replies still name their intended station.
+                        # A second logical peer must not consume the first peer's acceptance.
+                        if (getattr(args, "filter_pia_destination", False)
+                                and kind == stp.CONNECTION_RESPONSE and len(m.payload) >= 15
+                                and (int.from_bytes(m.payload[3:11], 'big') != our_constant
+                                     or int.from_bytes(m.payload[11:15], 'big') != args.src_var)):
+                            continue
+                        st["replies"].append((now, st["phase"], m.payload.hex()))
+                        # only a connection response carries a result; an ack's byte 1 is padding
+                        result = (m.payload[1] if kind == stp.CONNECTION_RESPONSE
+                                  and len(m.payload) > 1 else None)
+                        st["reply"] = (kind, result)
+                        st["reply_payload"] = m.payload
+                        if st["waiter"] is not None:
+                            st["waiter"].set()
+                        print(f"\n[rx] t={now:6.2f} *** STATION PROTOCOL, type {kind} "
+                              f"({len(m.payload)} B), phase {st['phase']} ***")
+                        if kind == stp.CONNECTION_RESPONSE:
+                            print(f"[rx]     {stp.parse_connection_response(m.payload)}")
+                        print(f"[rx]     {m.payload.hex()}\n")
+                        record(rec="station_protocol", t=now, phase=st["phase"], kind=kind,
+                               payload=m.payload.hex())
+                    elif m.protocol == rtt.PROTOCOL:
+                        st["rtt_requests"] += 1
+                        reply = rtt.response_for(m.payload) if args.rtt else None
+                        d = rtt.parse(m.payload) if len(m.payload) >= rtt.SIZE else None
+                        if reply is not None:
+                            sock.sendto(wrap(keys, our_mac, args.src_var, st["dst_var"],
+                                             next_nonce(), reply, rtt.PROTOCOL, port=rtt.PORT),
+                                        (st["dst_ip"], PIA_PORT))
+                            st["rtt_answers"] += 1
+                        record(rec="rtt", t=now, phase=st["phase"], payload=m.payload.hex(),
+                               parsed=d, answered=reply is not None)
+                        if st["rtt_requests"] <= 3 or st["rtt_requests"] % 20 == 0:
+                            print(f"[rx] t={now:6.2f} RTT {d['name'] if d else '?'} "
+                                  f"#{st['rtt_requests']}"
+                                  + (f" -> answered {st['rtt_answers']}" if reply else ""))
+                    elif m.protocol == rl.PROTOCOL:
+                        # the reliable protocol; its payload is the game
+                        st["reliable"] += 1
+                        try:
+                            d = rl.parse(m.payload)
+                        except ValueError as exc:
+                            print(f"[rx] t={now:6.2f} RELIABLE, unparsed: {exc}")
+                            record(rec="reliable_bad", t=now, payload=m.payload.hex(),
+                                   error=str(exc))
+                            continue
+                        body = (rl.parse_ack_payload(d["payload"]) if d["is_ack"]
+                                and len(d["payload"]) >= 2 else None)
+                        print(f"\n[rx] t={now:6.2f} *** RELIABLE seq {d['sequence_id']} "
+                              f"stream {d['stream_id']} pending {d['lowest_pending']} "
+                              f"[{'|'.join(d['flag_names'])}] {d['payload_size']} B ***")
+                        print(f"[rx]     {d['payload'].hex(' ')}\n")
+                        if d["flags"] & rl.FLAG_APPLICATION_DATA:
+                            st["rel_max_seq"] = max(st["rel_max_seq"], d["sequence_id"])
+                            st["rel_streams"].add(d["stream_id"])
+                            # A message may span packets: every one captured so far (331 bytes at
+                            # most) arrived START|END in one, but a 697-byte record need not.
+                            # Fragments are joined per stream in sequence order; a repeat of a seen
+                            # sequence is dropped.
+                            frag = st["rel_fragments"].setdefault(d["stream_id"], {})
+                            if d["flags"] & rl.FLAG_MESSAGE_START:
+                                frag.clear()
+                            if d["sequence_id"] in frag:
+                                record(rec="reliable_repeat", t=now, seq=d["sequence_id"])
+                            frag[d["sequence_id"]] = d["payload"]
+                            if not d["flags"] & rl.FLAG_MESSAGE_END:
+                                record(rec="reliable_fragment", t=now, seq=d["sequence_id"],
+                                       flags=d["flags"], stream=d["stream_id"],
+                                       payload=d["payload"].hex())
+                                continue
+                            if len(frag) > 1:
+                                d["payload"] = b"".join(frag[k] for k in sorted(frag))
+                                print(f"[rx] t={now:6.2f} reassembled {len(frag)} fragments, "
+                                      f"{len(d['payload'])} B")
+                            frag.clear()
+                            if d["flags"] & rl.FLAG_ZLIB:
+                                # the reliable header's own compression: the 23-byte standby list
+                                # arrives as a 20-byte zlib stream and read raw it is a 0x48
+                                # "NetBonusStart" with an impossible length
+                                try:
+                                    d["payload"] = zlib.decompress(d["payload"])
+                                except zlib.error as e:
+                                    print(f"[rx] t={now:6.2f} zlib-flagged payload did not "
+                                          f"inflate ({e}): {d['payload'].hex()}")
+                            g = room.parse(d["payload"]) if len(d["payload"]) >= 3 else None
+                            if g:
+                                record(rec="game_message", t=now, data_id=g["data_id"],
+                                       name=g["name"], fields=g.get("fields"),
+                                       payload=d["payload"].hex())
+                            if g and "join" in g:
+                                st["their_position"] = g["join"]
+                                print(f"[rx] t={now:6.2f} {g['name']}: avatar "
+                                      f"{g['join']['avatar_id']} at "
+                                      f"({g['join']['x']:.2f}, {g['join']['z']:.2f}) "
+                                      f"facing {g['join']['rot_y']}")
+                            elif g and g.get("fields") is not None:
+                                print(f"[rx] t={now:6.2f} {g['name']}: {g['fields']}")
+                            elif g:
+                                print(f"[rx] t={now:6.2f} {g['name']}, "
+                                      f"{g['length']} B{' (opaque)' if g['opaque'] else ''}")
+                            if g and g["data_id"] == room.ZONE and g.get("fields"):
+                                st["their_zone"] = g["fields"]
+                            if g and g["data_id"] in args.request_ids:
+                                st["requested_answers"].setdefault(g["data_id"], []).append(
+                                    d["payload"].hex())
+                                print(f"[rx] t={now:6.2f} *** {g['name']} - AN ANSWER TO OUR "
+                                      f"REQUEST: {d['payload'].hex(' ')} ***")
+                                record(rec="requested_answer", t=now, data_id=g["data_id"],
+                                       payload=d["payload"].hex())
+                            if g and g["data_id"] == room.REQUEST and g.get("fields"):
+                                # `RequestData.RequestDataID` names a data id; 0x23 is the one the
+                                # console answers itself.
+                                st["requests"] += 1
+                                st["last_request"] = g["fields"]["RequestDataID"]
+                                if g["fields"]["RequestDataID"] == room.STATE:
+                                    # A request for NetCharacterStateData means the game made a
+                                    # character out of us. It has matched the screen in every run:
+                                    # non-zero when an avatar appeared, zero across 265 sends when
+                                    # none did.
+                                    if not st["state_requests"]:
+                                        print(f"\n[rx] t={now:6.2f} *** IT ASKED FOR "
+                                              f"NetCharacterStateData - THE GAME HAS CREATED A "
+                                              f"CHARACTER FROM US ***\n")
+                                    st["state_requests"] += 1
+                                if args.answer_requests:
+                                    await answer_the_request(g, now, via="reliable")
+                            if g and g["data_id"] in (room.TRADE_TRANER, room.TRADE_POKE,
+                                                      room.TRADE_POKE_CHECK_OK,
+                                                      room.TRADE_READY_OK, room.RETURN_SELECT):
+                                # d["payload"] is the game message; `m.payload` still carries the
+                                # reliable header, and passing that hands the parser nine bytes too
+                                # many and takes the station down mid-trade.
+                                await answer_the_trade(g, d["payload"], now)
+                            if g and g["data_id"] in answer_with and g["data_id"] not in st["answered_with"]:
+                                # Record mixing and ball capsules: the console sends its own
+                                # record, waits for ours, and applies the exchange only on
+                                # receiving it (docs/bdsp_protocol.md). One answer per id.
+                                st["answered_with"].add(g["data_id"])
+                                answer_body = pathlib.Path(answer_with[g["data_id"]]).read_bytes()
+                                reply = room.build(g["data_id"], answer_body)
+                                print(f"\n[tx] t={now:6.2f} *** ANSWERING {room.name(g['data_id'])} "
+                                      f"with {len(answer_body)} bytes from {answer_with[g['data_id']]} ***")
+                                record(rec="answer_with", t=now, data_id=g["data_id"],
+                                       payload=reply.hex())
+                                # As a task of its own: awaiting the acked send here would hold
+                                # the receiver, and the ack it waits for arrives through it.
+                                nursery.start_soon(send_on_the_window, reply,
+                                                   f"answer {room.name(g['data_id'])}")
+                            if g and g["data_id"] == room.STATE and g.get("fields"):
+                                note_their_state(g["fields"], now)
+                            if g and g["data_id"] == room.TALK_RESERVE_RESULT and g.get("fields"):
+                                st["reserve_results"] += 1
+                                # IsCanTalk: 0 accepts, 1 declines.
+                                st["reserve_accepted"] = g["fields"].get("IsCanTalk") == 0
+                                print(f"\n[rx] t={now:6.2f} *** IT ANSWERED OUR APPROACH - "
+                                      f"NetDataTalkReserveResultData {g['fields']} ***\n")
+                                record(rec="reserve_result", t=now, fields=g["fields"])
+                            if (g and g["data_id"] == room.TALK_RESERVE
+                                    and args.answer_talk):
+                                # The player pressed A on our character. The talk is a
+                                # request/response and the console blocks on the answer: unanswered,
+                                # the player's own character freezes until the game is rebooted.
+                                await answer_the_talk(now)
+                            if args.reliable_auto_ack and st["rel_handshaken"]:
+                                ack = rl.build_ack_message(st["rel_max_seq"] + 1,
+                                                           stream_id=d["stream_id"])
+                                sock.sendto(wrap(keys, our_mac, args.src_var, st["dst_var"],
+                                                 next_nonce(), ack, rl.PROTOCOL, port=rl.PORT),
+                                            (st["dst_ip"], PIA_PORT))
+                                st["rel_acks"] += 1
+                        else:
+                            # a control message: reset, reset ack or a bulk ack
+                            st["rel_control"].append((now, d["flags"], m.payload.hex()))
+                            if len(d["payload"]) >= 2:
+                                try:
+                                    body = rl.parse_ack_payload(d["payload"])
+                                except ValueError:
+                                    body = None
+                                if body and body["entries"]:
+                                    st["their_ack_id"] = max(
+                                        st["their_ack_id"],
+                                        max(e["ack_id"] for e in body["entries"]))
+                            print(f"[rx] t={now:6.2f} *** RELIABLE CONTROL "
+                                  f"[{'|'.join(d['flag_names']) or 'no flags'}] "
+                                  f"{m.payload.hex()} ***")
+                        record(rec="reliable", t=now, phase=st["phase"], flags=d["flags"],
+                               stream=d["stream_id"], seq=d["sequence_id"],
+                               pending=d["lowest_pending"], payload=d["payload"].hex(),
+                               is_ack=d["is_ack"],
+                               ack={"count": body["count"]} if body else None)
+                    elif m.protocol == UNRELIABLE_PROTOCOL:
+                        # the game's live state; these packets carry a footer, which the GCM tag
+                        # does not cover
+                        st["unreliable"] += 1
+                        record(rec="unreliable", t=now, phase=st["phase"], port=m.port,
+                               dest=m.destination, payload=m.payload.hex())
+                        # Every unreliable payload is a whole game message (968 in the archive,
+                        # three types). The 0x04 request arrives here and never on the reliable
+                        # protocol.
+                        g = room.parse(m.payload) if len(m.payload) >= room.HEADER_SIZE else None
+                        if g and not g["truncated"] and g["length"] + room.HEADER_SIZE == len(m.payload):
+                            record(rec="game_message", t=now, via="unreliable",
+                                   data_id=g["data_id"], name=g["name"], fields=g.get("fields"),
+                                   payload=m.payload.hex())
+                            if g["data_id"] == room.REQUEST and g.get("fields"):
+                                st["requests"] += 1
+                                st["last_request"] = g["fields"]["RequestDataID"]
+                                if g["fields"]["RequestDataID"] == room.STATE:
+                                    if not st["state_requests"]:
+                                        print(f"\n[rx] t={now:6.2f} *** IT ASKED FOR "
+                                              f"NetCharacterStateData - THE GAME HAS CREATED A "
+                                              f"CHARACTER FROM US ***\n")
+                                    st["state_requests"] += 1
+                                if args.answer_requests:
+                                    await answer_the_request(g, now, via="unreliable")
+                            if g["data_id"] == room.STATE and g.get("fields"):
+                                note_their_state(g["fields"], now)
+                        else:
+                            g = None
+                        if st["unreliable"] <= 5 or st["unreliable"] % 25 == 0:
+                            print(f"[rx] t={now:6.2f} UNRELIABLE #{st['unreliable']} "
+                                  f"({len(m.payload)} B) "
+                                  + (f"{g['name']} {g.get('fields', '')}" if g
+                                     else m.payload[:32].hex(' ')))
+                    else:
+                        print(f"[rx] t={now:6.2f} protocol {m.protocol} port {m.port} "
+                              f"({len(m.payload)} B) - something new")
+
+        async def sweep_reliable_ack():
+            """Ack the reliable data, sweeping the two bytes the binary does not spell out.
+
+            The bulk-ack payload's shape is the serialiser's, byte for byte (main.bin 0x0159718c,
+            size 0x0159716c = 2 + 21n). Two fields are not read: the payload's first byte - the
+            consumer tests its bit 0 at 0x01596c98 and sets a flag at protocol+0x738, so it is a
+            bitfield and not a version - and the entry's second halfword, which comes from the
+            window's own field 0x50 and is filed per station at protocol+0x7b8.
+
+            The verdict is free and fast: an ack that lands stops the retransmission, and the
+            console is retransmitting several times a second. Silence IS the pass here, so each
+            candidate is only believed after the traffic has been flowing right up to it.
+            """
+            if not st["rel_max_seq"]:
+                print("[cx] no reliable data to ack yet")
+                return
+            ack_id, streams = st["rel_max_seq"], sorted(st["rel_streams"]) or [0]
+
+            # On a RESET the byte at offset 1 is a counter: `0x0159fa24` rejects it when it
+            # equals the value the console holds for us and `0x0159fa4c` when it is not exactly
+            # one more. Sweep that byte, in the framing everything else already works in.
+            def send(msg, label):
+                st["phase"] = label
+                sock.sendto(wrap(keys, our_mac, args.src_var, st["dst_var"], next_nonce(), msg,
+                                 rl.PROTOCOL, port=rl.PORT), (st["dst_ip"], PIA_PORT))
+
+            def state():
+                return (st["reliable"], len(st["rel_control"]), st["rel_max_seq"])
+
+            # Probe with data, not with an ack: a window that accepts an application message has
+            # to acknowledge it, and that acknowledgement is visible. An ack of our own can only be
+            # judged on silence. Sweep sequence ids because the receive window expects one
+            # particular next id.
+            print(f"\n[tx] --- application data, sweeping the sequence id. The console must "
+                  f"acknowledge one it accepts, so the answer is a REPLY and not a silence.")
+            for seq in range(args.reliable_sweep):
+                payload = bytes.fromhex("12000123")     # its own four bytes, echoed back
+                msg = (rl.build_header(rl.FLAG_APPLICATION_DATA | rl.FLAG_MESSAGE_START
+                                       | rl.FLAG_MESSAGE_END | rl.FLAG_IS_INITIALIZED,
+                                       seq, len(payload), lowest_pending=seq) + payload)
+                before = state()
+                send(msg, f"data seq={seq}")
+                record(rec="tx_reliable_data", t=time.monotonic() - t0, seq=seq,
+                       message=msg.hex())
+                await trio.sleep(1.0)
+                control = st["rel_control"][before[1]:]
+                print(f"[tx]   DATA  seq={seq}: "
+                      + (f"*** ANSWERED {[hex(c[1]) for c in control]} ***" if control
+                         else "no control message back"))
+                record(rec="reliable_data_result", seq=seq,
+                       control=[c[1] for c in control], data=state()[0] - before[0])
+                if control:
+                    print(f"\n[cx] *** THE CONSOLE ACKNOWLEDGED OUR DATA at sequence {seq} ***")
+                    for _, flags, raw in control:
+                        d = rl.parse(bytes.fromhex(raw))
+                        if d["is_ack"] and len(d["payload"]) >= 2:
+                            print(f"[cx]     {rl.parse_ack_payload(d['payload'])}")
+                    print("\n[tx] --- and now its own data, acked back in the same shape")
+                    # The window is known from here on, so the receiver acks every later arrival
+                    # at rel_max_seq + 1 whatever the sweep concludes. The sweep's verdict is "the
+                    # console went quiet", which a console still asking for something never
+                    # satisfies, and an ack two beyond its last sequence is ignored.
+                    st["rel_handshaken"] = True
+                    ok = await ack_the_console()
+                    if ok and args.room_walk:
+                        await walk_the_room(seq + 1)
+                    return
+
+            print("[cx] the data probe was never answered; not acking blind")
+
+        async def answer_the_talk(now):
+            """Answer a NetDataTalkReserveData, on the reliable stream it arrived on."""
+            reply = room.build_talk_reserve_result(can_talk=args.can_talk,
+                                                   is_recruitment=args.recruiting,
+                                                   emoticon_state=args.state)
+            seq = st["their_ack_id"]
+            if not seq:
+                record(rec="talk_unanswered_no_seq", t=now)
+                return
+            msg = (rl.build_header(rl.FLAG_APPLICATION_DATA | rl.FLAG_MESSAGE_START
+                                   | rl.FLAG_MESSAGE_END | rl.FLAG_IS_INITIALIZED,
+                                   seq, len(reply), lowest_pending=seq) + reply)
+            sock.sendto(wrap(keys, our_mac, args.src_var, st["dst_var"], next_nonce(), msg,
+                             rl.PROTOCOL, port=rl.PORT), (st["dst_ip"], PIA_PORT))
+            st["talk_answers"] += 1
+            print(f"\n[tx] t={now:6.2f} *** IT ASKED TO TALK - answered "
+                  f"NetDataTalkReserveResultData at seq {seq}: {reply.hex(' ')} ***\n")
+            record(rec="talk_answered", t=now, seq=seq, reply=reply.hex())
+            # The console parks in TalkState GREETING and waits to be advanced. One --after-talk
+            # is one message, in order, on the reliable stream, at the sequence id the console is
+            # asking for at the time.
+            for spec in args.after_talk:
+                await trio.sleep(args.after_talk_gap)
+                data_id, _, body_hex = spec.partition(":")
+                payload = room.build(int(data_id, 0), bytes.fromhex(body_hex))
+                seq = st["their_ack_id"]
+                if not seq:
+                    record(rec="after_talk_no_seq", t=now, spec=spec)
+                    continue
+                m = (rl.build_header(rl.FLAG_APPLICATION_DATA | rl.FLAG_MESSAGE_START
+                                     | rl.FLAG_MESSAGE_END | rl.FLAG_IS_INITIALIZED,
+                                     seq, len(payload), lowest_pending=seq) + payload)
+                sock.sendto(wrap(keys, our_mac, args.src_var, st["dst_var"], next_nonce(), m,
+                                 rl.PROTOCOL, port=rl.PORT), (st["dst_ip"], PIA_PORT))
+                now2 = time.monotonic() - t0
+                print(f"[tx] t={now2:6.2f}   after-talk {room.name(payload[0])} at seq {seq}: "
+                      f"{payload.hex(' ')}")
+                record(rec="after_talk_sent", t=now2, spec=spec, seq=seq, message=payload.hex())
+
+        async def answer_the_request(message, now, via="reliable"):
+            """Answer a NetRequestData with the message it names, ON THE PROTOCOL IT ARRIVED ON.
+
+            THE STREAM DECIDES THE STREAM. All 4333 requests for 0x23 came in on the reliable
+            protocol and all 55 for 0x04 on the unreliable one, with no crossover in nineteen runs,
+            and each is where the console puts its own answer - so replying on the other one would
+            be a framing mistake.
+
+            On the reliable stream the sequence id is taken FRESH: the window is shared with the
+            console's own sends and anything below its ack id is discarded in silence. One
+            send, no retransmission - the console repeats the request, so a lost answer costs
+            nothing and the next request is another chance.
+            """
+            if via == "reliable" and st.get("dig_burst_inflight"):
+                record(rec="dig_burst_request_deferred", t=now)
+                return
+            reply = room.answer(message, state=args.state, is_recruitment=args.recruiting,
+                                match_wait=args.match_wait)
+            wanted = message["fields"]["RequestDataID"]
+            if reply is None:
+                print(f"[tx] t={now:6.2f} it asked for {room.name(wanted)} and this table cannot "
+                      f"build one")
+                record(rec="request_unanswerable", t=now, requested=wanted)
+                return
+            if via == "unreliable":
+                sock.sendto(wrap(keys, our_mac, args.src_var, st["dst_var"], next_nonce(), reply,
+                                 UNRELIABLE_PROTOCOL, port=0, destination=0xFFFFFFFF,
+                                 message_flags=rl.MESSAGE_FLAGS), (st["dst_ip"], PIA_PORT))
+                st["request_answers"] += 1
+                print(f"[tx] t={now:6.2f} answered its request for {room.name(wanted)} on the "
+                      f"unreliable stream: {reply.hex(' ')}")
+                record(rec="request_answered", t=now, requested=wanted, via=via,
+                       reply=reply.hex())
+                return
+            seq = st["their_ack_id"]
+            if not seq:
+                record(rec="request_unanswered_no_seq", t=now, requested=wanted)
+                return
+            msg = (rl.build_header(rl.FLAG_APPLICATION_DATA | rl.FLAG_MESSAGE_START
+                                   | rl.FLAG_MESSAGE_END | rl.FLAG_IS_INITIALIZED,
+                                   seq, len(reply), lowest_pending=seq) + reply)
+            sock.sendto(wrap(keys, our_mac, args.src_var, st["dst_var"], next_nonce(), msg,
+                             rl.PROTOCOL, port=rl.PORT), (st["dst_ip"], PIA_PORT))
+            st["request_answers"] += 1
+            print(f"[tx] t={now:6.2f} answered its request for {room.name(wanted)} at seq {seq}: "
+                  f"{reply.hex(' ')}")
+            record(rec="request_answered", t=now, requested=wanted, via=via, seq=seq,
+                   reply=reply.hex())
+
+        async def walk_the_room(seq):
+            """Put a position of OUR OWN into the room, and see whether the game draws it.
+
+            Everything until now has been below the game. A position message is the first thing this
+            project has sent that the GAME could act on, so the signal is the console's SCREEN, not
+            the capture. It walks a small square around wherever the console's own avatar last was,
+            so anything that appears is next to the player rather than across the room.
+            """
+            here = st["their_position"] or {"x": 0.0, "z": 0.0}
+            print(f"\n[tx] --- WALKING: {args.room_walk} positions around "
+                  f"({here['x']:.2f}, {here['z']:.2f}). WATCH THE CONSOLE'S SCREEN.")
+            # A line separates the two readings of a character's identity: one avatar walking
+            # means the identity is the station, a trail of them means it is the position.
+            async def send_reliable(payload, seq, label, tries=12):
+                """Send one reliable message and RETRANSMIT until the console's ack covers it.
+
+                A single join often draws nothing; twenty-odd of them and the
+                room filled up. One message gets one chance, and this project had never retransmitted
+                anything - which is the entire point of a sliding window. The console's ack id is a
+                positive signal, so this says whether the join LANDED, separately from whether the
+                game drew it.
+                """
+                # The ack id is the sequence the console wants next; anything below it is
+                # discarded in silence. The space is shared with the console's own sends, so the
+                # id is the next number in the whole window and not a count of what we have sent.
+                # Read it fresh on every attempt: a value read before the console's last message
+                # is already stale.
+                for attempt in range(tries):
+                    seq = st["their_ack_id"]
+                    if not seq:
+                        await trio.sleep(0.4)
+                        continue
+                    msg = (rl.build_header(rl.FLAG_APPLICATION_DATA | rl.FLAG_MESSAGE_START
+                                           | rl.FLAG_MESSAGE_END | rl.FLAG_IS_INITIALIZED,
+                                           seq, len(payload), lowest_pending=seq) + payload)
+                    st["phase"] = f"{label} seq={seq} try={attempt}"
+                    sock.sendto(wrap(keys, our_mac, args.src_var, st["dst_var"], next_nonce(), msg,
+                                     rl.PROTOCOL, port=rl.PORT), (st["dst_ip"], PIA_PORT))
+                    record(rec="tx_reliable_data", t=time.monotonic() - t0, label=label, seq=seq,
+                           attempt=attempt, message=msg.hex())
+                    await trio.sleep(0.4)
+                    if st["their_ack_id"] > seq:
+                        print(f"[tx]   {label}: landed at seq {seq} on try {attempt + 1} "
+                              f"(their ack id -> {st['their_ack_id']})")
+                        record(rec="reliable_data_acked", label=label, seq=seq,
+                               attempts=attempt + 1, ack_id=st["their_ack_id"])
+                        return True
+                print(f"[tx]   {label} seq={seq}: never acked in {tries} tries "
+                      f"(their ack id {st['their_ack_id']})")
+                record(rec="reliable_data_unacked", label=label, seq=seq, ack_id=st["their_ack_id"])
+                return False
+
+            if args.room_pattern == "fixed":
+                # A burst of joins at one spot, each at the sequence id the console is asking
+                # for. Whatever lands stacks in one place, so the movement updates have one
+                # character to move.
+                x0, z0 = here["x"] + args.join_offset_x, here["z"] + args.join_offset_z
+                # The spawn offset is one side of the player, with no collision and no map, so a
+                # player standing against the wall on that side gets a character spawned through
+                # it. Have them stand clear.
+                #
+                # `OpcManager.CreateCharaData(ANetData<JoinData>)` builds a
+                # CharaData{stationIndex, assetName, colorId, avatarId, sexId} out of this message.
+                # avatarId indexes `UnionCharacterTable.SheetSheet1{ID, AssetName}` and the asset
+                # name is what `OpLoadCharacter` loads from "persons/field/"; GetSexId and
+                # GetNpcColorId read the same value.
+                join = room.build_join(x0, 0.0, z0, rot_y=90,
+                                       avatar_id=args.join_avatar, color_id=args.join_color)
+                print(f"[tx]   {args.room_walk} joins, ALL at ({x0:.2f}, {z0:.2f}), "
+                      f"avatar {args.join_avatar} colour {args.join_color}")
+                for i in range(args.room_walk):
+                    seq = st["their_ack_id"]
+                    if not seq:
+                        await trio.sleep(0.4)
+                        continue
+                    msg = (rl.build_header(rl.FLAG_APPLICATION_DATA | rl.FLAG_MESSAGE_START
+                                           | rl.FLAG_MESSAGE_END | rl.FLAG_IS_INITIALIZED,
+                                           seq, len(join), lowest_pending=seq) + join)
+                    st["phase"] = f"burst seq={seq}"
+                    sock.sendto(wrap(keys, our_mac, args.src_var, st["dst_var"], next_nonce(), msg,
+                                     rl.PROTOCOL, port=rl.PORT), (st["dst_ip"], PIA_PORT))
+                    record(rec="tx_reliable_data", t=time.monotonic() - t0, label="burst", seq=seq,
+                           attempt=i, message=msg.hex())
+                    if i % 4 == 0:
+                        print(f"[tx]     join {i} at seq {seq}")
+                    await trio.sleep(0.4)
+                print(f"\n[tx]   --- now moving whatever is standing there, to the RIGHT")
+                # A walk has to end inside the room to be watched. Sixty steps of 0.93 is 55.8
+                # units: the character crosses the floor, is pushed back by the game's collision
+                # and leaves through the far wall.
+                for i in range(args.room_walk_steps):
+                    # The console's own speed, over 80 of its NetPosData messages: 0.93 units per
+                    # message every 0.41 s. A ninth of that renders as a stutter.
+                    stride = args.room_walk_stride
+                    x, x_next = x0 + stride * i, x0 + stride * (i + 1)
+                    body = room.build_pos(room.pos_span((x, z0), (x_next, z0), 90))
+                    sock.sendto(wrap(keys, our_mac, args.src_var, st["dst_var"], next_nonce(),
+                                     body, UNRELIABLE_PROTOCOL, port=0,
+                                     destination=0xFFFFFFFF, message_flags=rl.MESSAGE_FLAGS),
+                                (st["dst_ip"], PIA_PORT))
+                    record(rec="tx_pos", t=time.monotonic() - t0, x=x, z=z0, message=body.hex())
+                    if i % 15 == 0:
+                        print(f"[tx]     pos {i}: ({x:.2f}, {z0:.2f})")
+                    await trio.sleep(args.room_walk_period)
+
+                if args.send_card:
+                    # `NetDataTranerCardData` carries fashionId, bodyType and genderid. No
+                    # console has been captured sending one, so the layout rests on opendpr alone.
+                    # It goes on the reliable stream and is retransmitted until acked, so the
+                    # capture says whether it landed separately from what the screen did.
+                    card = room.build_trainer_card(fashion_id=args.card_fashion,
+                                                   body_type=args.card_body,
+                                                   gender_id=args.card_gender,
+                                                   trainer_id=args.card_trainer_id)
+                    print(f"\n[tx]   --- TRAINER CARD: fashion {args.card_fashion}, body "
+                          f"{args.card_body}, gender {args.card_gender}, id "
+                          f"{args.card_trainer_id}. WATCH HER APPEARANCE.")
+                    await send_reliable(card, st["their_ack_id"], "trainer-card")
+                st["room_done"] = True
+                return
+
+            if args.room_pattern == "move":
+                # One join, then NetPosData on the unreliable stream: that is how the game moves
+                # a player it already knows about. Every join spawns another character.
+                x0, z0 = here["x"] + 1.5, here["z"]
+                print(f"[tx]   ONE join at ({x0:.2f}, {z0:.2f}), retransmitted until it is acked")
+                landed = await send_reliable(room.build_join(x0, 0.0, z0, rot_y=90), seq, "join")
+                if not landed:
+                    print("[cx] the join never landed; nothing after it can mean anything")
+                    return
+                print(f"[tx]   ONE avatar should be standing at ({x0:.2f}, {z0:.2f}) now")
+                # and now move it, batched the way the console batches: twelve points a message
+                for i in range(args.room_walk):
+                    # The twelve points span the stride. A message describes where the player has
+                    # been since the last one, so its points have to reach the next message's
+                    # first; points packed tighter make the avatar creep and then jump.
+                    stride = args.room_walk_stride
+                    x, x_next = x0 + stride * i, x0 + stride * (i + 1)
+                    pts = room.pos_span((x, z0), (x_next, z0), 90)
+                    body = room.build_pos(pts)
+                    sock.sendto(wrap(keys, our_mac, args.src_var, st["dst_var"], next_nonce(),
+                                     body, UNRELIABLE_PROTOCOL, port=0,
+                                     destination=0xFFFFFFFF, message_flags=rl.MESSAGE_FLAGS),
+                                (st["dst_ip"], PIA_PORT))
+                    record(rec="tx_pos", t=time.monotonic() - t0, x=x, z=z0, message=body.hex())
+                    if i % 8 == 0:
+                        print(f"[tx]   pos {i}: ({x:.2f}, {z0:.2f})")
+                    await trio.sleep(args.room_walk_gap)
+                return
+
+            square = [(1.0, 0.0, 90), (0.0, 1.0, 180), (-1.0, 0.0, 270), (0.0, -1.0, 0)]
+            for i in range(args.room_walk):
+                if args.room_pattern == "square":
+                    dx, dz, angle = square[i % len(square)]
+                elif args.room_pattern == "fixed":
+                    dx, dz, angle = 2.0, 0.0, 270
+                else:                                   # "line": step away, a quarter unit at a time
+                    dx, dz, angle = 1.0 + i * 0.25, 0.0, 90
+                payload = room.build_join(here["x"] + dx, 0.0, here["z"] + dz, rot_y=angle)
+                msg = (rl.build_header(rl.FLAG_APPLICATION_DATA | rl.FLAG_MESSAGE_START
+                                       | rl.FLAG_MESSAGE_END | rl.FLAG_IS_INITIALIZED,
+                                       seq + i, len(payload), lowest_pending=seq + i) + payload)
+                st["phase"] = f"walk {seq + i}"
+                sock.sendto(wrap(keys, our_mac, args.src_var, st["dst_var"], next_nonce(), msg,
+                                 rl.PROTOCOL, port=rl.PORT), (st["dst_ip"], PIA_PORT))
+                record(rec="tx_position", t=time.monotonic() - t0, seq=seq + i,
+                       x=here["x"] + dx, z=here["z"] + dz, angle=angle, message=msg.hex())
+                print(f"[tx]   position seq={seq + i}: "
+                      f"({here['x'] + dx:.2f}, {here['z'] + dz:.2f}) facing {angle}")
+                await trio.sleep(args.room_walk_gap)
+
+        async def ack_the_console(stream_id=0):
+            """Ack the console's own reliable data, in the shape it acks ours with."""
+            for delta in (1, 0, 2):
+                ack_id = st["rel_max_seq"] + delta
+                msg = rl.build_ack_message(ack_id, stream_id=stream_id)
+                before = st["reliable"]
+                st["phase"] = f"ack {ack_id}"
+                sock.sendto(wrap(keys, our_mac, args.src_var, st["dst_var"], next_nonce(), msg,
+                                 rl.PROTOCOL, port=rl.PORT), (st["dst_ip"], PIA_PORT))
+                record(rec="tx_reliable_ack", t=time.monotonic() - t0, ack_id=ack_id,
+                       message=msg.hex())
+                await trio.sleep(args.reliable_ack_wait)
+                got = st["reliable"] - before
+                print(f"[tx]   ACK   up to {ack_id}: {got} reliable message(s) after it"
+                      + ("   *** THE RETRANSMIT STOPPED ***" if got == 0 else ""))
+                record(rec="reliable_ack_result", ack_id=ack_id, after=got)
+                if got == 0:
+                    print(f"\n[cx] *** THE CONSOLE'S RELIABLE DATA IS ACKED, up to {ack_id} ***")
+                    return True
+            return False
+
+        async def sender():
+            async def ask(payload, protocol, label, timeout=None, src_var=None):
+                """Send one station-protocol message and wait for a reply. -> the result code, or
+                None for silence. Silence is a real answer here, so it costs the full timeout."""
+                st["phase"] = label
+                st["reply"] = None
+                st["waiter"] = trio.Event()
+                pkt = wrap(keys, our_mac, src_var if src_var is not None else args.src_var,
+                           dst_var, next_nonce(), payload, protocol, port=stp.PORT_UNRELIABLE)
+                sock.sendto(pkt, (dst_ip, PIA_PORT))
+                record(rec="tx_request", t=time.monotonic() - t0, label=label, dst=dst_ip,
+                       size=len(payload), request=payload.hex())
+                # Keep waiting past an ack: the console acknowledges the request before it
+                # answers it, so returning on the first reply throws a real acceptance away.
+                deadline = time.monotonic() + (timeout or args.gap)
+                while True:
+                    with trio.move_on_at(trio.current_time()
+                                         + max(0.0, deadline - time.monotonic())):
+                        await st["waiter"].wait()
+                    got = st["reply"]
+                    if got is None:
+                        return None                # silence, which is itself an answer
+                    kind, result = got
+                    if kind == stp.CONNECTION_RESPONSE:
+                        st["waiter"] = None
+                        return result
+                    if time.monotonic() >= deadline:
+                        st["waiter"] = None
+                        return ("other", kind)     # only after waiting the whole timeout out
+                    st["reply"] = None
+                    st["waiter"] = trio.Event()
+
+            def request(protocols, ack_id=1):
+                return stp.build_connection_request(
+                    target_constant, target_var, protocols, location, network_id=0,
+                    player_infos=infos, ack_id=ack_id)
+
+            await trio.sleep(args.listen_first)
+            if st["seq"] is None:
+                print("[cx] no update session seen - the console is not hosting a Pia network")
+                return
+            target_constant = st["host_constant_seen"] or host_constant
+            target_var = st["host_var"]
+
+            st["phase"] = "ack"
+            print(f"\n[tx] acking seq={st['seq']} until the rebroadcast stops")
+            deadline = time.monotonic() + args.ack_seconds
+            while time.monotonic() < deadline:
+                sock.sendto(wrap(keys, our_mac, args.src_var, 0, next_nonce(),
+                                 lp.build_ack(st["seq"]), lp.PROTOCOL), (bcast, PIA_PORT))
+                record(rec="tx_ack", t=time.monotonic() - t0, seq=st["seq"])
+                await trio.sleep(0.1)
+                quiet = time.monotonic() - t0 - (st["last_update"] or 0)
+                if st["updates"] > 3 and quiet > args.quiet_for:
+                    print(f"[tx] the rebroadcast stopped ({quiet:.2f}s quiet)")
+                    break
+            else:
+                print("[tx] the rebroadcast did NOT stop; carrying on anyway")
+
+            dst_ip = bcast if not args.unicast else host_ip
+            dst_var = 0 if not args.unicast else target_var
+            st["dst_ip"], st["dst_var"] = dst_ip, dst_var
+            location = stp.station_location(our_ip, getattr(args, 'endpoint_port', PIA_PORT), our_constant, args.src_var,
+                                            our_service)
+            infos = [stp.player_info(args.name)]
+
+            count = args.count
+            if count is None:
+                print(f"\n[tx] --- sweeping for the console's protocol count, {dst_ip}")
+                for n in range(args.min_protocols, args.max_protocols + 1):
+                    got = await ask(request([(args.probe_id, args.probe_version)] * n, n + 1),
+                                    stp.PROTOCOL, f"count={n}")
+                    print(f"[tx] count={n:2d}  "
+                          f"{'REPLY ' + str(got) if got is not None else 'silence'}")
+                    if got is not None:
+                        count = n
+                        break
+                if count is None:
+                    print("[cx] the whole count sweep was silent - the target ids are wrong, "
+                          "not the count (see the harness)")
+                    return
+            print(f"\n[cx] the console registers {count} protocols")
+            record(rec="protocol_count", count=count)
+            if args.connect:
+                # The minimal valid request, needing no knowledge of the console's protocols: an
+                # id it does not register expects version 0, so `count` entries of (0xFF, 0) pass
+                # the whole version loop. What refuses afterwards is the second stage, 0x0154fcfc.
+                print(f"\n[tx] --- one well-formed connection request, {count} x (0xff, 0)")
+                for attempt in range(args.connect):
+                    payload = stp.build_connection_request(
+                        target_constant, target_var, [stp.FILLER] * count, location,
+                        network_id=0, player_infos=infos, ack_id=attempt + 1)
+                    # 4 s, not 2: the console takes over three seconds to accept when it has a
+                    # stale station of ours to time out first
+                    got = await ask(payload, stp.PROTOCOL, f"connect#{attempt}",
+                                    timeout=args.connect_timeout)
+                    name = ("silence" if got is None
+                            else stp.RESULT_NAMES.get(got, f"result {got}"))
+                    print(f"[tx]   attempt {attempt}: {name}")
+                    record(rec="connect", attempt=attempt, result=got)
+                    if got == stp.RESULT_ACCEPTED:
+                        print("\n[cx] *** ACCEPTED INTO THE MESH ***")
+                        d = stp.parse_connection_response(st["reply_payload"])
+                        record(rec="accepted", response=st["reply_payload"].hex())
+                        print(f"[cx] the host's {len(d['protocols'])} protocols: "
+                              + ", ".join(f"{p:#04x}v{v}" for p, v in d["protocols"]))
+                        print(f"[cx] host location {d['location']['private']} "
+                              f"constant={d['location']['constant_id']:#018x} "
+                              f"variable={d['location']['variable_id']:#010x}")
+                        print(f"[cx] network id {d['network_id']:#010x}  "
+                              f"players {d['players']}  {d['player_names']}")
+                        # a connection response is repeated every 500 ms until it is acknowledged,
+                        # so this is what turns an acceptance into a finished handshake
+                        print(f"[cx] acking the acceptance, ack id {d['ack_id']:#010x}")
+                        for _ in range(args.ack_repeats):
+                            sock.sendto(wrap(keys, our_mac, args.src_var, dst_var, next_nonce(),
+                                             stp.build_ack(d["ack_id"]), stp.PROTOCOL,
+                                             port=stp.PORT_UNRELIABLE), (dst_ip, PIA_PORT))
+                            record(rec="tx_station_ack", t=time.monotonic() - t0,
+                                   ack_id=d["ack_id"])
+                            await trio.sleep(0.25)
+                        st["phase"] = "station-connected"
+                        print("[cx] station handshake closed")
+                        if not args.join:
+                            print("[cx] listening for what the mesh says next")
+                            break
+                        # The mesh join: six bytes, station index 253 ("not in a mesh yet"),
+                        # retransmitted every 500 ms. Pia gives up after ten seconds.
+                        print(f"\n[tx] --- mesh join request (protocol {mp.PROTOCOL:#04x} v3)")
+                        for attempt in range(args.join):
+                            st["phase"] = f"join#{attempt}"
+                            req = mp.build_join_request(attempt + 1)
+                            sock.sendto(wrap(keys, our_mac, args.src_var, dst_var, next_nonce(),
+                                             req, mp.PROTOCOL, port=mp.PORT_UNRELIABLE),
+                                        (dst_ip, PIA_PORT))
+                            record(rec="tx_join", t=time.monotonic() - t0, attempt=attempt,
+                                   request=req.hex())
+                            # Wait for the join response, not for any reply: the console acks our
+                            # join request on the station protocol and that arrives first.
+                            deadline = time.monotonic() + 2.0
+                            while (st["join_response"] is None
+                                   and time.monotonic() < deadline):
+                                await trio.sleep(0.05)
+                            if st["join_response"] is None:
+                                print(f"[tx]   join {attempt}: no join response yet")
+                                continue
+                            print(f"[tx]   join {attempt}: answered")
+                            break
+                        st["phase"] = "joined"
+                        # A mesh message is acked on the station protocol: BDSP's mesh handlers
+                        # read the ack id and hand it to a MeshStationProtocol method
+                        # (0x0154b984 -> 0x01550324), so the eight-byte type-5 ack goes out on
+                        # 0x14. mesh_protocol.ack_for() is that rule.
+                        # the receiver acks every copy as it arrives; watch for them stopping
+                        st["phase"] = "join-ack"
+                        quiet_for = max(args.quiet_for, 1.5)   # two missed 500 ms repeats
+                        deadline = time.monotonic() + args.join_ack_seconds
+                        while time.monotonic() < deadline:
+                            await trio.sleep(0.25)
+                            if st["last_join_response"] is None:
+                                continue
+                            quiet = (time.monotonic() - t0) - st["last_join_response"]
+                            if quiet > quiet_for:
+                                print(f"\n[tx] the join response stopped ({quiet:.2f}s quiet after "
+                                      f"{st['join_responses']} copies, {st['join_acks']} acked)")
+                                break
+                        else:
+                            print(f"\n[tx] the join response did NOT stop "
+                                  f"({st['join_responses']} copies, {st['join_acks']} acked)")
+                        record(rec="join_acked", copies=st["join_responses"],
+                               acks=st["join_acks"])
+                        st["phase"] = "joined"
+                        if args.reliable_ack:
+                            await sweep_reliable_ack()
+                        break
+                    await trio.sleep(args.connect_gap)
+                st["phase"] = "after"
+                return
+
+            if not args.identify:
+                return
+
+            async def probe(pid, version, var_id=None, src_var=None, tries=3):
+                """One version probe. A reply is guaranteed now, so silence is a lost packet and
+                gets retried rather than read as a match."""
+                loc = location
+                if var_id is not None:
+                    loc = stp.station_location(our_ip, PIA_PORT, our_constant, var_id, our_service)
+                for _ in range(tries):
+                    st["phase"] = f"id={pid:#04x} v={version}"
+                    payload = stp.build_connection_request(
+                        target_constant, target_var, stp.version_probe(pid, version, count), loc,
+                        network_id=0, player_infos=infos, ack_id=1)
+                    got = await ask(payload, stp.PROTOCOL, st["phase"], src_var=src_var)
+                    if got is None:
+                        continue                       # a lost packet, not an answer
+                    if isinstance(got, tuple):
+                        record(rec="odd_reply", pid=pid, version=version, reply=repr(got))
+                        return None, got
+                    return stp.read_version(got), got
+                return None, None
+
+            ids = ([int(x, 0) for x in args.ids.split(",")] if args.ids
+                   else list(range(256)) if args.sweep_ids else list(stp.KNOWN_PROTOCOL_IDS))
+            print(f"\n[tx] --- probing {len(ids)} protocol id(s) at version 1")
+            registered, unregistered, unknown = {}, [], []
+            for pid in ids:
+                d, raw = await probe(pid, 1)
+                if d is None:
+                    unknown.append(pid)
+                    print(f"[tx]   {pid:#04x}  NO ANSWER after retries")
+                    continue
+                if d == "lower":                       # expected < 1, so it is 0: not registered
+                    unregistered.append(pid)
+                    continue
+                if d == "equal":
+                    registered[pid] = 1
+                    print(f"[tx]   {pid:#04x}  version 1")
+                    continue
+                search = stp.VersionSearch(lo=2, first=2)   # expected > 1, bisect the rest
+                while not search.done:
+                    dd, _ = await probe(pid, search.next_version())
+                    if dd is None:
+                        break
+                    search.feed(dd)
+                registered[pid] = search.found
+                print(f"[tx]   {pid:#04x}  version {search.found} ({search.probes} probes)")
+            st["result"] = {"count": count, "registered": registered,
+                            "unregistered": len(unregistered), "unknown": unknown}
+            record(rec="protocols", count=count, registered=registered,
+                   unregistered=unregistered, unknown=unknown)
+            print(f"[cx] {len(registered)} registered, {len(unregistered)} not, "
+                  f"{len(unknown)} unanswered - the console said {count}")
+
+            print("\n[cx] --- confirming each version against both neighbours")
+            for pid, v in sorted(registered.items()):
+                if v is None:
+                    continue
+                below, _ = await probe(pid, max(0, v - 1))
+                above, _ = await probe(pid, min(255, v + 1))
+                ok = below == "higher" and above == "lower"
+                print(f"[cx]   {pid:#04x} v{v}: v-1 {below}, v+1 {above}"
+                      f"  {'CONFIRMED' if ok else 'NOT CONFIRMED'}")
+                record(rec="confirm", pid=pid, version=v, below=below, above=above, ok=ok)
+
+            if args.vary_var and registered:
+                # result 7 is the second stage refusing (0x0154fcfc -> 0x11c0f): our variable id
+                # is already in the array at session+0x3b8. Use a fresh one.
+                pid, v = sorted((k, x) for k, x in registered.items() if x)[0]
+                print(f"\n[cx] --- what the second stage refuses: {pid:#04x} v{v}, "
+                      f"varying the variable id")
+                for label, var_id, src in (("as sent", args.src_var, None),
+                                           ("location id + 1", args.src_var + 1, None),
+                                           ("location id = 2", 2, None),
+                                           ("location id = host's", target_var, None),
+                                           ("location id = 0x7fffffff", 0x7FFFFFFF, None),
+                                           ("packet src_var differs", args.src_var, 0x5150A001)):
+                    _, raw = await probe(pid, v, var_id=var_id, src_var=src)
+                    name = stp.RESULT_NAMES.get(raw, raw)
+                    print(f"[cx]   {label:26s} var={var_id:#010x} -> {name}")
+                    record(rec="vary_var", label=label, var_id=var_id, src_var=src, result=raw)
+
+            st["phase"] = "after"
+
+        async def answer_the_trade(g, payload, now):
+            try:
+                await _answer_the_trade(g, payload, now)
+            except Exception as exc:                                  # noqa: BLE001
+                # A handler that raises drops our station, and the console reads a station that
+                # vanishes mid-trade as a cancellation.
+                print(f"\n[cx] *** the trade answer failed and the run is CARRYING ON: "
+                      f"{type(exc).__name__}: {exc} ***\n")
+                record(rec="trade_answer_error", t=now, error=f"{type(exc).__name__}: {exc}")
+
+        async def _answer_the_trade(g, payload, now):
+            """Answer the console's own half of a trade with ours.
+
+            It sends who it is and then what it is offering, and waits. A run that reached both was
+            answered with nothing, so the player sat on "En attente d'une reponse".
+
+            NOTHING HERE COMPLETES A TRADE. The exchange itself is further down the flow - the
+            player still has to confirm on their own screen, and `TradeStateModel$$WriteSaveData`
+            -> `ReplacePoke` is what would put a Pokemon into their save. Declining at that
+            confirmation leaves the save untouched.
+            """
+            if not args.trade_reply:
+                return
+            if g["data_id"] == room.TRADE_POKE_CHECK_OK:
+                # `46 00 01 01` is the console reporting that it looked at our Pokemon and found
+                # it acceptable. The same acknowledgement goes back and nothing beyond it: the next
+                # message, NetDataTradeReadyOkData, leads to the exchange and to the console
+                # writing its save, which is the user's call.
+                st["check_oks"] += 1
+                print(f"\n[rx] t={now:6.2f} *** IT ACCEPTED OUR POKEMON - "
+                      f"NetDataTradePokeCheckOkData {payload.hex(' ')} ***")
+                record(rec="their_check_ok", t=now, payload=payload.hex())
+                reply = room.build_fields(room.TRADE_POKE_CHECK_OK, 1)
+                label = "our check-ok"
+            elif g["data_id"] == room.RETURN_SELECT:
+                # A completed trade ends on this question. It arrives once a second and does not
+                # stop, so only the first is answered.
+                # A completed trade ends the security phase and the repeater has to be cleared.
+                # In SELECT_WINDOW a 0x21 goes to `TradeSelectPokeModel$$ReciveReadyOk`, which
+                # writes targetTradeState; `WaitBoxWindowComplete` needs it to be WAIT(2), so a
+                # repeater still sending SEND_READYOK(5) holds the next trade in the box window
+                # until the console reports the cancellation as ours.
+                if st["our_security_state"] or st["their_security_state"] is not None:
+                    print(f"[cx]   trade complete - security phase over, repeater quiet")
+                    record(rec="security_phase_end", t=now)
+                st["our_security_state"] = 0
+                st["their_security_state"] = None
+                st["return_selects"] += 1
+                if not args.answer_return_select or st["return_selects"] > 1:
+                    if st["return_selects"] == 2:
+                        print(f"[cx]   NetDataReturnSelectData again - answered once, not repeating")
+                    return
+                print(f"\n[rx] t={now:6.2f} *** THE POST-TRADE QUESTION - "
+                      f"NetDataReturnSelectData {payload.hex(' ')} ***")
+                record(rec="their_return_select", t=now, payload=payload.hex(),
+                       fields=g.get("fields"))
+                reply = room.build_fields(room.RETURN_SELECT, args.return_select_value)
+                label = f"our return-select {args.return_select_value}"
+            elif g["data_id"] == room.TRADE_READY_OK and (g.get("fields") or {}).get("isTradeOk"):
+                # The security phase is a different machine from the handshake above.
+                # `TradeSecurityController$$ReciveState` [0x1cd2ff0] drops anything whose isTradeOk
+                # is not 1.
+                their = (g.get("fields") or {})["tradeState"]
+                st["their_security_state"] = their
+                print(f"\n[rx] t={now:6.2f} *** SECURITY PHASE: their state "
+                      f"{room.TRADE_STATE_NAMES.get(their, their)} ***")
+                record(rec="their_security_state", t=now, state=their)
+                if not args.complete_trade:
+                    record(rec="security_state_declined", t=now)
+                    return
+                st["our_security_state"] = room.mirror_trade_state(their)
+                reply = room.build_trade_ready_ok(st["our_security_state"], is_trade_ok=1)
+                st["ready_oks_sent"] += 1
+                label = (f"our state {room.TRADE_STATE_NAMES.get(st['our_security_state'])} "
+                         f"(theirs {room.TRADE_STATE_NAMES.get(their)})")
+            elif g["data_id"] == room.TRADE_READY_OK:
+                # The last message before the console writes its save. Answering it with
+                # tradeState=WAIT satisfies the second half of
+                # `<WaitBoxWindowComplete>d__24`'s condition, the manager moves to SECURIY_TRADE,
+                # and `TradeStateModel$$InitState` calls `PlayerSave`. Off unless --complete-trade.
+                st["their_ready_ok"] = g.get("fields")
+                print(f"\n[rx] t={now:6.2f} *** THEIR READY-OK: {st['their_ready_ok']} ***")
+                record(rec="their_ready_ok", t=now, fields=st["their_ready_ok"])
+                if not args.complete_trade:
+                    print("[cx]   NOT ANSWERED - --complete-trade is off, so the console stays in "
+                          "SELECT_WINDOW and no save is written")
+                    record(rec="ready_ok_declined", t=now)
+                    return
+                reply = room.build_trade_ready_ok()
+                st["ready_oks_sent"] += 1
+                label = "our ready-ok (THE CONSOLE SAVES AFTER THIS)"
+            elif g["data_id"] == room.TRADE_TRANER:
+                st["their_traner"] = room.parse_trade_traner(payload[room.HEADER_SIZE:])
+                print(f"\n[rx] t={now:6.2f} *** THEIR TRAINER RECORD: {st['their_traner']} ***")
+                record(rec="their_traner", t=now, fields=st["their_traner"])
+                reply = room.build_trade_traner(args.trade_name, args.trade_tid, args.trade_sid)
+                label = "our trainer record"
+            else:
+                try:
+                    theirs = pokemon.read(payload[room.HEADER_SIZE:])
+                except ValueError as exc:
+                    print(f"[cx] their Pokemon did not decode: {exc}")
+                    record(rec="their_poke_bad", t=now, error=str(exc))
+                    return
+                st["their_poke"] = theirs
+                print(f"\n[rx] t={now:6.2f} *** THEIR POKEMON: species {theirs['species']}, "
+                      f"{theirs['nickname']!r}, OT {theirs['ot_name']!r}, "
+                      f"IVs {theirs['ivs']} ***")
+                record(rec="their_poke", t=now, fields=theirs)
+                # One association carries as many trades as the player starts, so each offer
+                # also goes to a numbered copy; the plain path is always the latest.
+                st["their_pokes"] += 1
+                out = pathlib.Path(args.trade_save_poke)
+                numbered = out.with_name(f"{out.stem}_{st['their_pokes']}{out.suffix}")
+                out.write_bytes(payload[room.HEADER_SIZE:])
+                numbered.write_bytes(payload[room.HEADER_SIZE:])
+                print(f"[cx]   saved their Pokemon -> {out} and {numbered}")
+                if not st["our_poke"]:
+                    print("[cx] no --trade-template, so nothing to offer back")
+                    return
+                reply = room.build_trade_poke(st["our_poke"])
+                label = "our Pokemon"
+            send_trade_message(reply, label, now)
+
+        def send_trade_message(reply, label, now):
+            """Put one game message into the console's reliable window. Shared by the answers and
+            by the repeater, which needs the sequence id as it stands at the moment it fires."""
+            # One sequence id per message. `their_ack_id` is the console's "next id I expect from
+            # you" and only moves when it acks something, so two messages sent before that ack both
+            # carry it and the second is discarded as a retransmit.
+            seq = max(st["their_ack_id"], st["our_next_seq"])
+            if not seq:
+                record(rec="trade_reply_no_seq", t=now, label=label)
+                return
+            st["our_next_seq"] = seq + 1
+            msg = (rl.build_header(rl.FLAG_APPLICATION_DATA | rl.FLAG_MESSAGE_START
+                                   | rl.FLAG_MESSAGE_END | rl.FLAG_IS_INITIALIZED,
+                                   seq, len(reply), lowest_pending=seq) + reply)
+            sock.sendto(wrap(keys, our_mac, args.src_var, st["dst_var"], next_nonce(), msg,
+                             rl.PROTOCOL, port=rl.PORT), (st["dst_ip"], PIA_PORT))
+            st["trade_replies"] += 1
+            print(f"[tx] t={now:6.2f} *** SENT {label} at seq {seq} ({len(reply)} B) ***\n")
+            record(rec="trade_reply", t=now, label=label, seq=seq, length=len(reply))
+
+        async def repeat_the_security_state():
+            """Say our state again every second, once the security phase has started.
+
+            ONE ANSWER PER MESSAGE IS NOT ENOUGH. `TradeParentStateModel$$StateProc`'s
+            WAIT_READYOK case only leaves that state when `targetIsTradeReadyOk` is set, and
+            `TradeSecurityController$$ReciveState` sets it when a message ARRIVES while the console
+            is in state 6; a CHILD console likewise leaves SEND_READYOK only on a message arriving
+            there. Nothing we send in reply to something else is guaranteed to land inside either.
+            """
+            while True:
+                await trio.sleep(args.security_repeat)
+                if st["their_security_state"] is None or not st["our_security_state"]:
+                    continue
+                if st["their_ack_id"] < st["our_next_seq"]:
+                    # something we sent is still unacked; adding to it fills the window rather
+                    # than saying anything the console has not already been told
+                    continue
+                now = time.monotonic() - t0
+                send_trade_message(
+                    room.build_trade_ready_ok(st["our_security_state"], is_trade_ok=1),
+                    f"repeat state {room.TRADE_STATE_NAMES.get(st['our_security_state'])}", now)
+
+        def note_their_state(fields, now):
+            """The console broadcasts its OWN OpcState, and an emote is visible in it.
+
+            Measured: state 0 until the player opened the Y menu, `state 4 isRecruiment 1` while the
+            trade emote was up (t=74 and t=124), back to 0 when it came down. So the run can SEE
+            the console become approachable instead of being told.
+            """
+            was = st["their_state"]
+            st["their_state"] = fields
+            # Gate on `isRecruiment`, not on "state is non-zero": state 4 carries isRecruiment 1
+            # and state 18, a console already inside a trade, carries 0.
+            if fields.get("isRecruiment") and fields != was:
+                st["their_recruiting"] += 1
+                print(f"\n[rx] t={now:6.2f} *** THE PLAYER IS ADVERTISING: {fields} - "
+                      f"their character is now approachable ***\n")
+                record(rec="their_state", t=now, fields=fields)
+            elif was and fields.get("state") == 0 and was.get("state"):
+                print(f"[rx] t={now:6.2f}   their emote came down ({fields})")
+                record(rec="their_state", t=now, fields=fields)
+
+        async def initiate_the_talk():
+            """WALK UP TO THEIR CHARACTER. The roles reversed: they advertise, we approach.
+
+            Picking an emote locks the player in place waiting to be interacted with, so when the
+            console is the recruiter nothing can happen until someone approaches it - and every run
+            earlier runs waited to be approached instead. `UnionStateController$$SwitchTalkStateMine`
+            is the approacher's path and it is the one whose messages we have read.
+
+            Sent only once their broadcast state says they are advertising, so the run cannot spend
+            its approach on a player who is still walking around.
+            """
+            # Our character must exist first: an approach from a station the game has not drawn
+            # yet is declined.
+            while not st["room_done"]:
+                await trio.sleep(0.5)
+            # Every invitation gets an attempt, not just the first: a stale state would
+            # otherwise spend the only approach.
+            seen = st["their_recruiting"]
+            while True:
+                while st["their_recruiting"] == seen:
+                    await trio.sleep(0.5)
+                seen = st["their_recruiting"]
+                await trio.sleep(args.initiate_delay)
+                if await one_approach():
+                    return
+                print("\n[cx] --- that approach came to nothing; waiting for them to advertise "
+                      "again\n")
+
+        async def send_on_the_window(payload, label, tries=12, fast=False):
+            """One reliable message, retransmitted until the console's ack covers it. -> landed?
+
+            The sequence id is read fresh on every try: the console's ack id is the next number it
+            wants and anything below it is dropped in silence.
+            """
+            fixed_seq = None
+            for attempt in range(tries):
+                seq = fixed_seq if fast and fixed_seq is not None else st["their_ack_id"]
+                if fast and fixed_seq is not None and st["their_ack_id"] > fixed_seq:
+                    return True
+                if not seq:
+                    await trio.sleep(0.4)
+                    continue
+                if fast:
+                    fixed_seq = seq
+                msg = (rl.build_header(rl.FLAG_APPLICATION_DATA | rl.FLAG_MESSAGE_START
+                                       | rl.FLAG_MESSAGE_END | rl.FLAG_IS_INITIALIZED,
+                                       seq, len(payload), lowest_pending=seq) + payload)
+                sock.sendto(wrap(keys, our_mac, args.src_var, st["dst_var"], next_nonce(), msg,
+                                 rl.PROTOCOL, port=rl.PORT), (st["dst_ip"], PIA_PORT))
+                record(rec="tx_reliable_data", t=time.monotonic() - t0, label=label, seq=seq,
+                       attempt=attempt, message=msg.hex())
+                if fast:
+                    sent_at = time.monotonic()
+                    while st["their_ack_id"] <= seq and time.monotonic() - sent_at < .75:
+                        await trio.sleep(.01)
+                    remaining = getattr(args, "dig_attack_interval", .08) - (time.monotonic() - sent_at)
+                    if remaining > 0:
+                        await trio.sleep(remaining)
+                else:
+                    await trio.sleep(0.4)
+                if st["their_ack_id"] > seq:
+                    print(f"[tx]   {label} landed at seq {seq} on try {attempt + 1}")
+                    return True
+            print(f"[tx]   {label} never acked in {tries} tries")
+            return False
+
+        async def send_dig_burst(payloads):
+            seq = st["their_ack_id"]
+            if not seq:
+                return False
+            st["dig_burst_inflight"] = True
+            try:
+                for attempt in range(3):
+                    packet = wrap_dig_burst(keys, our_mac, args.src_var, st["dst_var"],
+                                             next_nonce(), payloads, seq)
+                    sock.sendto(packet, (st["dst_ip"], PIA_PORT))
+                    record(rec="tx_dig_burst", t=time.monotonic()-t0, first_seq=seq,
+                           count=len(payloads), attempt=attempt, datagram_size=len(packet))
+                    sent_at = time.monotonic()
+                    while st["their_ack_id"] < seq+len(payloads) and time.monotonic()-sent_at < .75:
+                        await trio.sleep(.005)
+                    if st["their_ack_id"] >= seq+len(payloads):
+                        await trio.sleep(max(0, args.dig_attack_interval-(time.monotonic()-sent_at)))
+                        return True
+                return False
+            finally:
+                st["dig_burst_inflight"] = False
+
+        async def ug_join():
+            """Join the Grand Underground: one NetUgJoinData in the console's own zone, next to it.
+
+            The Underground's `OnReceiveData` makes a character from a NetUgJoinData the way the
+            room does from a NetJoinData; the zone comes from the NetZoneData the console sends on
+            our arrival. Nothing has measured what the Underground does with the join yet."""
+            while st["their_zone"] is None:
+                await trio.sleep(0.2)
+            await trio.sleep(args.ug_join_delay)
+            z = st["their_zone"]
+            x, y, zz = z["pos"]
+            payload = room.build_ug_join(x + args.join_offset_x, y, zz + args.join_offset_z,
+                                         z["zoneID"], rot_y=90, avatar_id=args.join_avatar,
+                                         color_id=args.join_color)
+            print(f"\n[tx] --- UNDERGROUND JOIN in zone {z['zoneID']} at "
+                  f"({x + args.join_offset_x:.2f}, {zz + args.join_offset_z:.2f}): {payload.hex(' ')}")
+            record(rec="ug_join_sent", t=time.monotonic() - t0, zone=z["zoneID"])
+            landed = await send_on_the_window(payload, "underground join")
+            record(rec="ug_join_result", t=time.monotonic() - t0, reliable_acked=landed)
+            st["room_done"] = True
+            if (getattr(args, "diglett_points", 0)
+                    or getattr(args, "diglett_fill_from", None) is not None
+                    or getattr(args, "diglett_renew", False)):
+                if not landed:
+                    record(rec="diglett_probe_skipped", reason="underground_join_not_acked")
+                    return
+                await trio.sleep(2.0)
+                # A collection increment is not idempotent. Never resend it using a fresh
+                # sequence after an ambiguous ACK. One application datagram per probe.
+                if getattr(args, "diglett_renew", False):
+                    renewed = await diglett_renew(send_on_the_window, record,
+                                                  lambda: time.monotonic() - t0)
+                    if not renewed:
+                        raise RuntimeError("Diglett renewal stopped: delivery not acknowledged")
+                elif getattr(args, "diglett_fill_from", None) is not None:
+                    await diglett_fill_once(send_on_the_window, record, args.diglett_fill_from,
+                                            lambda: time.monotonic() - t0)
+                else:
+                    await diglett_increment_once(send_on_the_window, record, args.diglett_points,
+                                                  lambda: time.monotonic() - t0)
+                print("[diglett] Probe finished; verify the counter on the Switch. "
+                      "A transport ACK does not confirm a point or bonus.")
+            # and walk, on the unreliable stream, in the room's own encoding: an Underground
+            # NetPosData at (-79, 67.24) reads posX 1577, posZ 1345, which is -x / 0.05 and
+            # z / 0.05, the room's POS_SCALE.
+            await trio.sleep(2.0)
+            x0, z0 = x + args.join_offset_x, zz + args.join_offset_z
+            for i in range(args.room_walk_steps):
+                stride = args.room_walk_stride
+                xa, xb = x0 + stride * i, x0 + stride * (i + 1)
+                body = room.build_pos(room.pos_span((xa, z0), (xb, z0), 90))
+                sock.sendto(wrap(keys, our_mac, args.src_var, st["dst_var"], next_nonce(),
+                                 body, UNRELIABLE_PROTOCOL, port=0,
+                                 destination=0xFFFFFFFF, message_flags=rl.MESSAGE_FLAGS),
+                            (st["dst_ip"], PIA_PORT))
+                record(rec="tx_pos", t=time.monotonic() - t0, x=xa, z=z0, message=body.hex())
+                await trio.sleep(args.room_walk_period)
+            if args.room_walk_steps:
+                print(f"[tx]   walked {args.room_walk_steps} steps to ({xb:.2f}, {z0:.2f})")
+
+        async def inject_from_file():
+            """Send whatever --inject-file gains, one `ID:HEX` game message per line, on the
+            reliable window, so a flow that waits on us can be driven while the console waits
+            instead of relaunching the whole association for every next message."""
+            path = pathlib.Path(args.inject_file)
+            seen = 0
+            while True:
+                await trio.sleep(.01 if getattr(args, "dig_fast", False) else .5)
+                try:
+                    lines = path.read_text().splitlines()
+                except OSError:
+                    continue
+                while seen < len(lines):
+                    spec = lines[seen]
+                    seen += 1
+                    spec = spec.strip()
+                    if not spec or spec.startswith("#"):
+                        continue
+                    data_id, _, body_hex = spec.partition(":")
+                    try:
+                        payload = room.build(int(data_id, 0), bytes.fromhex(body_hex))
+                    except ValueError as exc:
+                        print(f"[inject] bad line {spec!r}: {exc}")
+                        continue
+                    if payload[0] == room.TALK and payload[3 + 1:3 + 5] == b"\x00\x00\x00\x00":
+                        print("[inject] refusing NetDataTalkData{CHECK} (a null dereference)")
+                        continue
+                    fast_attack = payload[0] == 0x27 and getattr(args, "dig_fast", False)
+                    if fast_attack and not (st.get("dig_wall_open") and st.get("dig_permission")):
+                        record(rec="dig_wall_batch_cancelled", t=time.monotonic()-t0,
+                               reason="wall_closed_or_no_permission")
+                        print("[dig] Discarding queued attacks: wall closed or permission absent")
+                        while seen < len(lines) and lines[seen].strip().lower().startswith('0x27:'):
+                            seen += 1
+                        continue
+                    now = time.monotonic() - t0
+                    print(f"\n[inject] t={now:6.2f} {room.name(payload[0])}: {payload.hex(' ')}")
+                    record(rec="inject_sent", t=now, spec=spec)
+                    if fast_attack:
+                        payloads = [payload]
+                        limit = getattr(args, "dig_burst_size", 1)
+                        while seen < len(lines) and len(payloads) < limit:
+                            candidate = lines[seen].strip()
+                            cid, _, body_hex = candidate.partition(':')
+                            try:
+                                if int(cid, 0) != 0x27:
+                                    break
+                                item = room.build(0x27, bytes.fromhex(body_hex))
+                            except ValueError:
+                                break
+                            if len(item) != 15:
+                                break
+                            payloads.append(item)
+                            seen += 1
+                            record(rec="inject_sent", t=time.monotonic()-t0, spec=candidate)
+                        if len(payloads) > 1:
+                            landed = await send_dig_burst(payloads)
+                        else:
+                            landed = await send_on_the_window(payload, f"inject {room.name(payload[0])}",
+                                                               tries=3, fast=True)
+                        for _ in payloads:
+                            record(rec="dig_attack_delivery", t=time.monotonic() - t0,
+                                   reliable_acked=landed)
+                        if not landed:
+                            record(rec="dig_attack_stopped", reason="delivery_ambiguous")
+                            return
+                    else:
+                        await send_on_the_window(payload, f"inject {room.name(payload[0])}")
+
+        async def request_sweep():
+            """Send each --pre-request message, then ask for each --request-ids message, once our
+            character exists.
+
+            The Union Room handler answers a NetRequestData for six ids and ignores the rest
+            (docs/bdsp_protocol.md, "What a request can fetch"); the reply comes back on the
+            reliable stream to the station that asked. The next message waits --request-gap
+            seconds so an answer can be told from the request after it.
+            """
+            while not st["room_done"]:
+                await trio.sleep(0.5)
+            await trio.sleep(args.request_delay)
+            for spec in args.pre_request:
+                data_id, _, body_hex = spec.partition(":")
+                payload = room.build(int(data_id, 0), bytes.fromhex(body_hex))
+                print(f"\n[tx] --- SENDING {room.name(payload[0])}: {payload.hex(' ')}")
+                record(rec="pre_request_sent", t=time.monotonic() - t0, spec=spec)
+                await send_on_the_window(payload, f"pre-request {room.name(payload[0])}")
+                await trio.sleep(args.request_gap)
+            for wanted in args.request_ids:
+                payload = room.build_request(wanted)
+                print(f"\n[tx] --- REQUESTING {room.name(wanted)}: {payload.hex(' ')}")
+                st["requests_sent"] += 1
+                record(rec="request_sent", t=time.monotonic() - t0, requested=wanted)
+                await send_on_the_window(payload, f"request {room.name(wanted)}")
+                await trio.sleep(args.request_gap)
+
+        async def one_approach():
+            """-> True if they accepted and the follow-up was sent, False to try again later."""
+            payload = room.build_talk_reserve()
+            print(f"\n[tx] --- APPROACHING THEIR CHARACTER: NetDataTalkReserveData "
+                  f"{payload.hex(' ')}, retransmitted until their ack covers it")
+            for attempt in range(args.initiate_tries):
+                seq = st["their_ack_id"]
+                if not seq:
+                    await trio.sleep(0.4)
+                    continue
+                msg = (rl.build_header(rl.FLAG_APPLICATION_DATA | rl.FLAG_MESSAGE_START
+                                       | rl.FLAG_MESSAGE_END | rl.FLAG_IS_INITIALIZED,
+                                       seq, len(payload), lowest_pending=seq) + payload)
+                sock.sendto(wrap(keys, our_mac, args.src_var, st["dst_var"], next_nonce(), msg,
+                                 rl.PROTOCOL, port=rl.PORT), (st["dst_ip"], PIA_PORT))
+                st["reserves_sent"] += 1
+                now = time.monotonic() - t0
+                print(f"[tx] t={now:6.2f}   approach #{attempt + 1} at seq {seq}")
+                record(rec="talk_reserve_sent", t=now, seq=seq, attempt=attempt)
+                await trio.sleep(args.initiate_gap)
+                if st["reserve_results"]:
+                    print("[cx] they answered our approach")
+                    if not st["reserve_accepted"]:
+                        # IsCanTalk 1 is the console declining. Never push a TalkData into a
+                        # declined conversation.
+                        print("[cx] *** THEY DECLINED (IsCanTalk 1). Sending NOTHING further. ***")
+                        record(rec="approach_declined", t=time.monotonic() - t0)
+                        st["reserve_results"] = 0
+                        return False
+                    # The initiator's own next message. CHECK is what
+                    # `UnionStateController$$SwitchTalkStateMine` builds, and that is the path of
+                    # the player who walked up; sent as the responder, the console cancels.
+                    for spec in args.after_approach:
+                        await trio.sleep(args.after_approach_gap)
+                        data_id, _, body_hex = spec.partition(":")
+                        payload = room.build(int(data_id, 0), bytes.fromhex(body_hex))
+                        # NetDataTalkData{talkState: CHECK} crashes the console. Its handler
+                        # `UnionStateController$$SwitchSpokenStateMine` sends talkState 0 down a
+                        # branch that reads systemController->msgWindow and, when that is null
+                        # (which it is for a player standing with an emote up), sets x19 = 0 and
+                        # dereferences it at 0x1fd5ec0 with no guard.
+                        if payload[0] == room.TALK and payload[3 + 1:3 + 5] == b"\x00\x00\x00\x00":
+                            print("[cx] *** REFUSING to send NetDataTalkData{talkState: CHECK} - "
+                                  "it is a null dereference in SwitchSpokenStateMine. "
+                                  "Use talkState GREETING (1). ***")
+                            record(rec="after_approach_refused", spec=spec, reason="talkstate_check")
+                            continue
+                        seq = st["their_ack_id"]
+                        if not seq:
+                            record(rec="after_approach_no_seq", spec=spec)
+                            continue
+                        m = (rl.build_header(rl.FLAG_APPLICATION_DATA | rl.FLAG_MESSAGE_START
+                                             | rl.FLAG_MESSAGE_END | rl.FLAG_IS_INITIALIZED,
+                                             seq, len(payload), lowest_pending=seq) + payload)
+                        sock.sendto(wrap(keys, our_mac, args.src_var, st["dst_var"], next_nonce(),
+                                         m, rl.PROTOCOL, port=rl.PORT), (st["dst_ip"], PIA_PORT))
+                        now2 = time.monotonic() - t0
+                        print(f"[tx] t={now2:6.2f}   after-approach {room.name(payload[0])} "
+                              f"at seq {seq}: {payload.hex(' ')}")
+                        record(rec="after_approach_sent", t=now2, spec=spec, seq=seq)
+                    return True
+            print(f"[cx] {st['reserves_sent']} approaches, no NetDataTalkReserveResultData back")
+            return False
+
+        async def keep_saying_match_wait():
+            """Repeat NetDataIsMatchWaitData{1} for the whole hold.
+
+            Answering the console's request for 0x23 works, but that request comes once, between
+            t=8.4 and t=9.4, and never again. The player reaches the trade option in the Y menu
+            around a minute in, by which time an answer-only run is silent - and the flag the game
+            reads is a piece of live state, not a one-off reply. `StartMatch` is gated on
+            `cmp w23,#1` [main.bin 0x01fd56e4] behind two null checks on the
+            UnionFrontDeskTradeController, which exists only once the player has entered that flow,
+            so the message has to still be arriving THEN.
+            """
+            await trio.sleep(args.match_wait_period)
+            sent = 0
+            while True:
+                seq = st["their_ack_id"]
+                if seq:
+                    payload = room.build_match_wait(True)
+                    msg = (rl.build_header(rl.FLAG_APPLICATION_DATA | rl.FLAG_MESSAGE_START
+                                           | rl.FLAG_MESSAGE_END | rl.FLAG_IS_INITIALIZED,
+                                           seq, len(payload), lowest_pending=seq) + payload)
+                    sock.sendto(wrap(keys, our_mac, args.src_var, st["dst_var"], next_nonce(), msg,
+                                     rl.PROTOCOL, port=rl.PORT), (st["dst_ip"], PIA_PORT))
+                    st["match_wait_sent"] = sent = sent + 1
+                    record(rec="match_wait_repeat", t=time.monotonic() - t0, seq=seq, n=sent)
+                    if sent % 10 == 1:
+                        print(f"[tx] t={time.monotonic() - t0:6.2f}   isMatchWait=1 #{sent} "
+                              f"at seq {seq}")
+                await trio.sleep(args.match_wait_period)
+
+        with trio.move_on_after(args.hold):
+            async with trio.open_nursery() as nursery:
+                nursery.start_soon(receiver)
+                nursery.start_soon(sender)
+                if args.match_wait and args.match_wait_period > 0:
+                    nursery.start_soon(keep_saying_match_wait)
+                if args.initiate_talk:
+                    nursery.start_soon(initiate_the_talk)
+                if args.request_ids or args.pre_request:
+                    nursery.start_soon(request_sweep)
+                if args.inject_file:
+                    nursery.start_soon(inject_from_file)
+                if args.ug_join:
+                    nursery.start_soon(ug_join)
+                if args.complete_trade:
+                    nursery.start_soon(repeat_the_security_state)
+
+        print(f"\n[cx] {st['updates']} update session(s), {len(st['replies'])} station-protocol "
+              f"reply/replies")
+        # the three signals this run exists to read, each a count and not a story
+        print(f"[cx] mesh join responses {st['join_responses']}, acked {st['join_acks']} "
+              f"(a couple is an ack that landed; eighteen means unacked)")
+        print(f"[cx] RTT requests {st['rtt_requests']}, answered {st['rtt_answers']}")
+        print(f"[cx] isMatchWait=1 repeats sent {st.get('match_wait_sent', 0)}")
+        print(f"[cx] their advertising state seen {st['their_recruiting']} time(s), "
+              f"approaches sent {st['reserves_sent']}, answered {st['reserve_results']}")
+        print(f"[cx] reliable messages {st['reliable']} "
+              f"(a repeat means it is still waiting to be acked)")
+        print(f"[cx] unreliable messages {st['unreliable']} - the game's live state")
+        print(f"[cx] reliable acks sent {st['rel_acks']}, their last position "
+              f"{st['their_position']}")
+        # A request that stops being asked has been answered.
+        print(f"[cx] NetRequestData received {st['requests']}"
+              + (f" (last for {room.name(st['last_request'])})" if st["last_request"] else "")
+              + f", answered {st['request_answers']}")
+        print(f"[cx] trade replies sent {st['trade_replies']}, their check-oks {st['check_oks']}, "
+              f"their ready-oks {'yes' if st['their_ready_ok'] else 'none'}, "
+              f"our ready-oks {st['ready_oks_sent']}"
+              + (" - and it entered the security phase" if st["their_security_state"] else ""))
+        if args.request_ids:
+            got = ", ".join(f"{room.name(i)} x{len(v)}" for i, v in st["requested_answers"].items())
+            print(f"[cx] our requests sent {st['requests_sent']} of {len(args.request_ids)}, "
+                  f"answered: {got or 'none'}")
+        # the verdict a capture can give on its own, without asking anyone to watch the screen
+        print(f"[cx] requests for NetCharacterStateData {st['state_requests']} - "
+              + ("THE GAME CREATED A CHARACTER FROM US" if st["state_requests"]
+                 else "nothing we sent became a character"))
+        record(rec="counters", join_responses=st["join_responses"],
+               join_acks=st["join_acks"], rtt_requests=st["rtt_requests"],
+               rtt_answers=st["rtt_answers"], reliable=st["reliable"],
+               unreliable=st["unreliable"], requests=st["requests"],
+               request_answers=st["request_answers"], last_request=st["last_request"],
+               state_requests=st["state_requests"])
+        if st["result"]:
+            reg = st["result"]["registered"]
+            print(f"[cx] the console said it registers {st['result']['count']} protocols, "
+                  f"and {len(reg)} answered:")
+            for pid, v in sorted(reg.items()):
+                print(f"[cx]   {pid:#04x}  version {v}")
+            if st["result"]["unknown"]:
+                print(f"[cx] unanswered: {[hex(x) for x in st['result']['unknown']]}")
+        elif st["replies"]:
+            print("[cx] PASS: the console answered on the mesh station protocol")
+        else:
+            print("[cx] silence throughout")
+        record(rec="end", updates=st["updates"], replies=len(st["replies"]), result=st["result"])
+    if cap:
+        cap.close()
+    return 0
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--comm-id", default=None)
+    ap.add_argument("--identity-mac", help="experimental separate Pia identity; radio MAC is unchanged")
+    ap.add_argument("--filter-pia-destination", action="store_true")
+    ap.add_argument("--dig-fast", action="store_true", help="experimental fast ACK-gated excavation injection")
+    ap.add_argument("--dig-burst-size", type=int, choices=range(1, 33), default=1,
+                    help="bundle up to this many separately sequenced excavation attacks")
+    ap.add_argument("--dig-attack-interval", type=float, default=.08,
+                    help="minimum seconds between fast excavation attacks")
+    ap.add_argument("--expected-scene", type=lambda s: int(s, 0), default=None,
+                    help="only select a network advertising this scene ID")
+    ap.add_argument("--diglett-points", type=int, choices=range(41), default=0,
+                    help="experimental: send ONE Diglett increment after Underground join ACK")
+    ap.add_argument("--diglett-fill-from", type=int, choices=range(40), default=None,
+                    help="complete one cycle from the counter observed on the Switch; stop on missing ACK")
+    ap.add_argument("--diglett-renew", action="store_true",
+                    help="send +40 every five seconds; active bonus ignores it, expiry allows renewal")
+    ap.add_argument("--keys", default="~/.switch/prod.keys")
+    ap.add_argument("--phy", default="auto")
+    ap.add_argument("--ifname", default="ldnclient")
+    ap.add_argument("--channels", default="1,6,11")
+    ap.add_argument("--dwell", type=float, default=1.5,
+                    help="seconds per channel in the scan; 0.8 missed a live network twice")
+    ap.add_argument("--name", default="PkCamp")
+    ap.add_argument("--hold", type=float, default=300.0)
+    ap.add_argument("--listen-first", type=float, default=5.0)
+    ap.add_argument("--ack-seconds", type=float, default=6.0)
+    ap.add_argument("--quiet-for", type=float, default=1.0)
+    ap.add_argument("--count", type=int, default=None,
+                    help="the console's protocol count, if already measured; skips the sweep")
+    ap.add_argument("--identify", action="store_true",
+                    help="after the count, read each candidate protocol's registered version")
+    ap.add_argument("--connect", type=int, default=0, metavar="N",
+                    help="send N well-formed connection requests and report what comes back")
+    ap.add_argument("--connect-gap", type=float, default=2.0)
+    ap.add_argument("--join", type=int, default=0, metavar="N",
+                    help="after the station handshake, send up to N mesh join requests")
+    ap.add_argument("--reliable-ack", action=argparse.BooleanOptionalAction, default=False,
+                    help="after the join, sweep the bulk acknowledgement until the console's "
+                         "reliable retransmission stops")
+    ap.add_argument("--room-walk", type=int, default=0, metavar="N",
+                    help="after the reliable handshake, send N position messages of our own and "
+                         "watch the console's screen")
+    ap.add_argument("--room-walk-gap", type=float, default=1.0)
+    ap.add_argument("--room-walk-steps", type=int, default=60, metavar="N",
+                    help="position messages in the burst pattern's walk. At the console's own "
+                         "stride, 60 is 55.8 units and leaves the Union Room entirely; "
+                         "pass 8 for a walk that ends where the screen can still see it")
+    ap.add_argument("--room-walk-period", type=float, default=room.POS_PERIOD,
+                    help="seconds between position messages in the burst pattern. The default is "
+                         "the console's own median gap")
+    ap.add_argument("--room-walk-stride", type=float, default=room.POS_STRIDE,
+                    help="units one position message spans. The default is what a console's own "
+                         "walk measures (0.93 units every 0.41 s, over 80 of its messages); our "
+                         "first walks did 0.15 every 0.6 s, which is a ninth of a real player's "
+                         "speed and is the whole of the stutter")
+    ap.add_argument("--answer-requests", action=argparse.BooleanOptionalAction, default=False,
+                    help="answer the console's NetRequestData with the message it names. It has "
+                         "asked for data id 0x23 in every capture since the first join and has "
+                         "never been answered; this is the probe, so arm it on its own")
+    ap.add_argument("--match-wait", action=argparse.BooleanOptionalAction, default=False,
+                    help="answer the console's request for NetDataIsMatchWaitData (0x23) with "
+                         "isMatchWait=1 instead of 0. ONE comparison in UnionRoomManager$$SetNetData "
+                         "gates the trade on it (`cmp w23, #1` at main.bin 0x01fd56e4, then "
+                         "UnionFrontDeskTradeController$$StartMatch); every run has "
+                         "answered 0, which is a station declining to be matched")
+    ap.add_argument("--trade-reply", action=argparse.BooleanOptionalAction, default=False,
+                    help="answer the console's trade messages with ours. It sends a trainer record "
+                         "and then a Pokemon and waits; with neither answered the player sits on "
+                         "\"En attente d'une reponse\". THIS DOES NOT COMPLETE A TRADE - the player "
+                         "still confirms on their own screen, and declining there leaves the save "
+                         "untouched")
+    ap.add_argument("--complete-trade", action=argparse.BooleanOptionalAction, default=False,
+                    help="answer NetDataTradeReadyOkData (0x21) with tradeState=WAIT and LET THE "
+                         "TRADE COMPLETE. THIS WRITES THE CONSOLE'S SAVE: the message is the only "
+                         "writer of the console's `targetTradeState`, both states at WAIT move "
+                         "UnionTradeManager to SECURIY_TRADE, and TradeStateModel$$InitState calls "
+                         "PlayerSave. The Pokemon the player picked leaves their box and ours takes "
+                         "its place. Needs --trade-reply. ASK THE USER FIRST")
+    ap.add_argument("--security-repeat", type=float, default=1.0, metavar="S",
+                    help="seconds between repeats of our security-phase state. The console's "
+                         "WAIT_READYOK only ends when a message ARRIVES inside it, and it enters "
+                         "that state on its own countdown, so the answer has to keep coming")
+    ap.add_argument("--trade-template", metavar="FILE",
+                    help="a PB8 to offer (328 or 344 bytes, encrypted or PKHeX's decrypted export), edited by --trade-species and friends. 328 "
+                         "bytes hold much more than this project has identified, so what we send "
+                         "is a real Pokemon with named fields changed rather than one invented "
+                         "from nothing")
+    ap.add_argument("--trade-species", type=int, metavar="N", help="species for the offered Pokemon")
+    ap.add_argument("--trade-nickname", metavar="TEXT", help="nickname for the offered Pokemon")
+    ap.add_argument("--answer-return-select", action="store_true",
+                    help="answer the NetDataReturnSelectData a completed trade ends on, ONCE. "
+                         "It is an announcement; the answer has no measured effect")
+    ap.add_argument("--return-select-value", type=int, default=1, metavar="N",
+                    help="the byte to answer it with (default 1, opendpr's `received`)")
+    ap.add_argument("--trade-ot", metavar="TEXT", help="OT name for the offered Pokemon")
+    ap.add_argument("--trade-name", default="PkCamp", metavar="TEXT",
+                    help="the name in OUR trainer record")
+    ap.add_argument("--trade-tid", type=int, default=44466, metavar="N")
+    ap.add_argument("--trade-sid", type=int, default=4080, metavar="N")
+    ap.add_argument("--trade-save-poke", default="scratchpad/their_poke.pb8", metavar="FILE",
+                    help="where to write the Pokemon the console offers")
+    ap.add_argument("--join-offset-x", type=float, default=2.0, metavar="U",
+                    help="where our character spawns relative to the console's own, on x. The "
+                         "default +2.0 is one fixed side, and a player standing against the wall "
+                         "on that side gets a character spawned out of bounds (followed by a "
+                         "crash). Negative puts it on the other side")
+    ap.add_argument("--join-offset-z", type=float, default=0.0, metavar="U",
+                    help="the same on z")
+    ap.add_argument("--initiate-talk", action=argparse.BooleanOptionalAction, default=False,
+                    help="APPROACH the console's character instead of waiting to be approached. "
+                         "Picking an emote locks a player in place waiting to be interacted with, "
+                         "so a recruiting console can only be reached by someone walking up to it. "
+                         "Waits for its broadcast state to say it is advertising, then sends "
+                         "NetDataTalkReserveData - the console's own bytes, 63 00 01 00")
+    ap.add_argument("--after-approach", action="append", default=[], metavar="ID:HEX",
+                    help="after THEY answer our approach, send this message - the initiator's own "
+                         "next one. `0x06:0000000000` is NetDataTalkData{sexId 0, CHECK}, which is "
+                         "what SwitchTalkStateMine builds. Repeatable, sent in order")
+    ap.add_argument("--after-approach-gap", type=float, default=1.0, metavar="S",
+                    help="seconds between the approach answer and each --after-approach message")
+    ap.add_argument("--initiate-delay", type=float, default=2.0, metavar="S",
+                    help="seconds to wait after the console starts advertising before approaching")
+    ap.add_argument("--initiate-tries", type=int, default=12, metavar="N",
+                    help="how many times to retransmit the approach before giving up")
+    ap.add_argument("--initiate-gap", type=float, default=1.0, metavar="S",
+                    help="seconds between approach retransmissions")
+    ap.add_argument("--match-wait-period", type=float, default=2.0, metavar="S",
+                    help="with --match-wait, ALSO send NetDataIsMatchWaitData{1} every S seconds "
+                         "for the whole hold (0 disables, leaving the answer-on-request). "
+                         "The console requests 0x23 once, at t=8.4-9.4, and the player reaches the "
+                         "trade option in the Y menu long after that")
+    ap.add_argument("--after-talk", action="append", default=[], metavar="ID:HEX",
+                    help="after answering the talk reservation, send this game message on the "
+                         "reliable stream - `0x08:00` is NetDataSelectData{index: 0}. Repeatable, "
+                         "sent in order. The console parks in TalkState GREETING and waits to be "
+                         "advanced, and which message does it is not readable offline: this is the "
+                         "sweep handle")
+    ap.add_argument("--after-talk-gap", type=float, default=0.6, metavar="S",
+                    help="seconds between the talk answer and each --after-talk message")
+    ap.add_argument("--answer-talk", action=argparse.BooleanOptionalAction, default=False,
+                    help="answer a NetDataTalkReserveData with a NetDataTalkReserveResultData. "
+                         "unanswered, the player's character freezes")
+    ap.add_argument("--can-talk", type=int, default=1, metavar="N",
+                    help="NetDataTalkReserveResultData.IsCanTalk - 1 accepts the talk, 0 refuses "
+                         "it. A refusal is the SAFE probe: it should release the player rather "
+                         "than open a flow we cannot hold up")
+    ap.add_argument("--state", type=int, default=room.STATE_NONE, metavar="N",
+                    help="the OpcState.OnlineState our character reports when the console asks "
+                         "for NetCharacterStateData. 0 NONE means \"doing nothing\" and is "
+                         "a character doing nothing; 3 RECRUITMENT_BATTLE, 4 RECRUITMENT_TRADE, "
+                         "5 RECRUITMENT_RECORD, 6 RECRUITMENT_GREETINGS, 8 COMMUNICATE")
+    ap.add_argument("--recruiting", type=int, default=0, metavar="N",
+                    help="StateData.isRecruiment, the second byte of the same answer")
+    ap.add_argument("--join-avatar", type=int, default=8, metavar="N",
+                    help="NetJoinData.avatarId, which is what picks the MODEL: it indexes "
+                         "UnionCharacterTable and OpLoadCharacter loads that asset name. 8 is what "
+                         "the default, the girl the screen shows")
+    ap.add_argument("--join-color", type=int, default=0, metavar="N",
+                    help="NetJoinData.colorId. The game also derives one from the avatar id "
+                         "(OpcManager.GetNpcColorId), so this may not be the deciding field")
+    ap.add_argument("--request-ids", type=lambda v: [int(x, 0) for x in v.split(",") if x],
+                    default=[], metavar="ID,ID",
+                    help="after the walk, send a NetRequestData for each of these data ids, one "
+                         "at a time on the reliable stream, and print what comes back. The Union "
+                         "Room answers six ids (docs/bdsp_protocol.md); 0x22 is the opaque one")
+    ap.add_argument("--pre-request", action="append", default=[], metavar="ID:HEX",
+                    help="a game message to put on the reliable stream before the first "
+                         "--request-ids request, e.g. 0x59:01000100 to add station 1 to the "
+                         "console's match-wait list. Repeatable, sent in order")
+    ap.add_argument("--ug-join", action=argparse.BooleanOptionalAction, default=False,
+                    help="Grand Underground: once the console's NetZoneData arrives, send a "
+                         "NetUgJoinData in its zone at its position plus --join-offset-x/z")
+    ap.add_argument("--ug-join-delay", type=float, default=2.0, metavar="S",
+                    help="seconds after the console's NetZoneData before the Underground join")
+    ap.add_argument("--answer-with", action="append", default=[], metavar="ID:FILE",
+                    help="when the console sends game message ID, answer once with the body in "
+                         "FILE (raw bytes, no header): 0x15:capsule.bin answers its ball capsule "
+                         "with ours, 0x14:record.bin its record")
+    ap.add_argument("--inject-file", metavar="PATH",
+                    help="poll this file and send each new `ID:HEX` line as a game message on the "
+                         "reliable window, retransmitted until acked. Lines are sent once, in "
+                         "order; `#` starts a comment")
+    ap.add_argument("--request-gap", type=float, default=3.0, metavar="S",
+                    help="seconds between one request landing and the next going out")
+    ap.add_argument("--request-delay", type=float, default=2.0, metavar="S",
+                    help="seconds after the walk before the first request")
+    ap.add_argument("--send-card", action=argparse.BooleanOptionalAction, default=False,
+                    help="after the walk, send a NetDataTranerCardData for our own station. It is "
+                         "the message that says what a player LOOKS like, and the probe is whether "
+                         "the character the game drew for us changes on screen")
+    ap.add_argument("--card-fashion", type=int, default=3, metavar="N")
+    ap.add_argument("--card-body", type=int, default=1, metavar="N")
+    ap.add_argument("--card-gender", type=int, default=1, metavar="N")
+    ap.add_argument("--card-trainer-id", type=int, default=41000, metavar="N")
+    ap.add_argument("--room-pattern", choices=("square", "line", "fixed", "move"), default="square",
+                    help="square spawns one avatar per corner; line and fixed ask whether the "
+                         "game's idea of identity is the station or the position")
+    ap.add_argument("--reliable-auto-ack", action=argparse.BooleanOptionalAction, default=True,
+                    help="acknowledge the console's reliable data as it arrives")
+    ap.add_argument("--reliable-sweep", type=int, default=8,
+                    help="how many values of the byte at offset 1 to try")
+    ap.add_argument("--reliable-ack-wait", type=float, default=1.5,
+                    help="how long silence has to last to count as an ack that landed")
+    ap.add_argument("--connect-timeout", type=float, default=4.0,
+                    help="how long one connection request waits for its answer")
+    ap.add_argument("--rtt", action=argparse.BooleanOptionalAction, default=True,
+                    help="answer the console's RTT requests (protocol 0x58) while we hold the seat")
+    ap.add_argument("--join-ack", action=argparse.BooleanOptionalAction, default=True,
+                    help="ack the mesh join response, on the STATION protocol")
+    ap.add_argument("--join-ack-seconds", type=float, default=8.0,
+                    help="how long to keep acking the mesh join response; the host repeats it "
+                         "every 500 ms until it is acknowledged")
+    ap.add_argument("--ack-repeats", type=int, default=3,
+                    help="how many times to ack the acceptance; the console repeats it until acked")
+    ap.add_argument("--sweep-ids", action="store_true",
+                    help="probe all 256 protocol ids, not only the ones the wiki names")
+    ap.add_argument("--ids", default=None, help="a comma-separated list of ids to probe instead")
+    ap.add_argument("--vary-var", action="store_true",
+                    help="after identifying, vary the variable id to find what result 7 tests")
+    ap.add_argument("--min-protocols", type=int, default=0)
+    ap.add_argument("--max-protocols", type=int, default=40)
+    ap.add_argument("--gap", type=float, default=0.4,
+                    help="seconds to wait for a reply; every probe gets one, so this is short")
+    ap.add_argument("--probe-id", type=lambda s: int(s, 0), default=0xFF,
+                    help="a protocol id the console does not register, so its version is 0")
+    ap.add_argument("--probe-version", type=int, default=1,
+                    help="1 against an expected 0 is a guaranteed 'version is too high'")
+    ap.add_argument("--src-var", type=lambda s: int(s, 0), default=0x2B7F4C11)
+    ap.add_argument("--unicast", action="store_true",
+                    help="only the unicast pass, skipping the broadcast one")
+    ap.add_argument("--broadcast-only", action="store_true",
+                    help="only the broadcast pass, the framing the ack proved")
+    ap.add_argument("--stop-on-reply", action="store_true", default=True)
+    ap.add_argument("--no-stop-on-reply", dest="stop_on_reply", action="store_false")
+    ap.add_argument("--capture", default=None)
+    return ap
+
+
+def main():
+    ap = build_parser()
+    args = ap.parse_args()
+    if not board_radio() and getattr(os, "geteuid", lambda: -1)() != 0:
+        ap.error("must run as root")
+    diglett_active = args.diglett_points or args.diglett_fill_from is not None or args.diglett_renew
+    if diglett_active and (not args.ug_join or args.expected_scene not in (0x3120, 0x3140)):
+        ap.error("Diglett needs --ug-join and --expected-scene 0x3120 or 0x3140")
+    if sum((bool(args.diglett_points), args.diglett_fill_from is not None, args.diglett_renew)) > 1:
+        ap.error("choose a single increment, one fill cycle or renewal")
+    if diglett_active and (args.inject_file or args.pre_request or args.answer_with):
+        ap.error("Diglett probe must run without other injected messages")
+    if args.complete_trade and not args.trade_reply:
+        # --complete-trade answers the last trade message; without --trade-reply the console
+        # never gets the trainer record or the Pokemon that come before it.
+        ap.error("--complete-trade needs --trade-reply")
+    if args.complete_trade:
+        print("[cx] *** --complete-trade IS ON: the console will WRITE ITS SAVE and the Pokemon "
+              "the player picks will LEAVE THEIR BOX ***")
+    return trio.run(main_async, args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

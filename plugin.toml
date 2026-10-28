@@ -1,0 +1,7 @@
+id = "bdsp-excavation"
+name = "BDSP — Excavation"
+version = "0.2.0"
+author = "Allan"
+api = "1.8"
+description = "Automatically clear new Grand Underground walls with two pickaxe helpers using one ESP32."
+module = "plugin"
